@@ -32,6 +32,7 @@ class InventoryModel():
                                            loc_col], dropna=False).sum()  # aggregate the order per week, product group and location
         print(self.data)
         print(self.data.groupby(product_col).agg(["size", "mean", "std"]))
+        self.data.to_csv("demand_input.csv")
         self.inv_model = pulp.LpProblem("Inventory_Optimization",
                                         LpMinimize)  # creates an object of an LpProblem (PuLP) to which we will assign variables, constraints and objective function
 
@@ -103,31 +104,40 @@ class InventoryModel():
                                                  self.factory_id,
                                                  self.time_id),
                                                 lowBound=0)
+        self.slack = pulp.LpVariable.dicts("slack",
+                                           (self.prod_id,
+                                            self.loc_id,
+                                            self.time_id),
+                                           lowBound=0)
 
     def define_objective(self):
         ''' Defines the objective funciton
         '''
-        holding_costs = lpSum((self.inv_level[i][w][t] * self.loc_data.loc[w, "holding costs"]
+        holding_costs = lpSum((self.inv_level[i][w][t] * self.loc_data.loc[w, "Hold. Costs"]
                                for i in self.prod_id
                                for w in self.loc_id
                                for t in self.time_id))
-        # ordering_costs = lpSum([self.order_dec[i][w][t] * self.order_cost
-        #                         for i in self.prod_id
-        #                         for w in self.loc_id
-        #                         for t in self.time_id])
+
         trans_costs_echelon1 = lpSum([self.FTL[o][d][t] * self.factory_dist.loc[o, d]
                                       for o in self.factory_id
                                       for d in self.dc_id
-                                      for i in self.prod_id
                                       for t in self.time_id])
         trans_costs_echelon2 = lpSum((self.FTL[o][d][t] * self.dc_dist.loc[o, d]
                                       for o in self.dc_id
                                       for d in self.wh_id
-                                      for i in self.prod_id
                                       for t in self.time_id))
+        production_costs = lpSum((self.production[i][f][t] * self.loc_data.loc[f, "Prod. Costs"])
+                                 for i in self.prod_id
+                                 for f in self.factory_id
+                                 for t in self.time_id)
+
+        # slack_costs = lpSum((self.slack[i][w][t] * 50000
+        #                      for i in self.prod_id
+        #                      for w in self.loc_id
+        #                      for t in self.time_id))
 
         self.inv_model += holding_costs + \
-            trans_costs_echelon1 + trans_costs_echelon2
+            trans_costs_echelon1 + trans_costs_echelon2  # + production_costs  # + slack_costs
 
     def define_constraints(self):
         '''Defines the constraints to be added to the model
@@ -141,22 +151,23 @@ class InventoryModel():
                             "Pallets", "std")] * 2.33 * self.weighted_avg(prevt, w, i)
 
                     else:
+                        self.inv_model += lpSum(self.safety_stock[i][w][t]) == self.demand_stats.loc[i, (
+                        "Pallets", "std")] * 2.33 * self.weighted_avg(t, w, i)
                         try:
-                            self.inv_model += lpSum(self.safety_stock[i][w][t]) == self.demand_stats.loc[i, (
-                                "Pallets", "std")] * 2.33 * (1 / len(self.loc_id))
-
                             self.inv_model += lpSum(
                                 self.data.loc[(t, i, w)] + self.safety_stock[i][w][t]) == self.inv_level[i][w][t]
 
                         except KeyError:
                             continue
 
-                    # self.inv_model += lpSum((self.inv_level[i][w][t] + self.safety_stock[i][w][t]
-                    #                          for i in self.prod_id)) <= self.loc_data.loc[w, "Capacity"]
+                    self.inv_model += lpSum((self.inv_level[i][w][t] + self.safety_stock[i][w][t]
+                                             for i in self.prod_id)) <= self.loc_data.loc[w, "Hold. Cap."]
 
         for f in self.factory_id:
             for ind, t in enumerate(self.time_id):
                 for i in self.prod_id:
+                    self.inv_model += lpSum((self.production[i][f][t]
+                                             for i in self.prod_id)) <= self.loc_data.loc[f, "Prod. Cap."]
                     try:
                         if ind != 0:
                             prevt = self.time_id[ind - 1]
@@ -164,14 +175,8 @@ class InventoryModel():
                                                     self.data.loc[(t, i, f)]
                                                     - self.shipment[f][dc][i][t]
                                                     + self.production[i][f][t]
-                                                    + self.safety_stock[i][f][t]
-                                                    for dc in self.dc_id) == self.inv_level[i][f][t]
-                        # else:
-                        #     self.inv_model += lpSum(self.data.loc[(t, i, f)]
-                        #                             - self.shipment[f][dc][i][t]
-                        #                             + self.production[i][f][t]
-                        #                             + self.safety_stock[i][f][t]
-                        #                             for dc in self.dc_id) == self.inv_level[i][f][t]
+                                                    for dc in self.dc_id) >= self.inv_level[i][f][t] + self.safety_stock[i][f][t]
+
                     except KeyError:
                         continue
 
@@ -185,18 +190,12 @@ class InventoryModel():
                                                     self.inv_level[i][d][prevt] -
                                                     self.data.loc[(t, i, d)]
                                                     - self.shipment[d][wh][i][t]
-                                                    + self.safety_stock[i][d][t]
                                                     for o in self.factory_id
-                                                    for wh in self.wh_id) == self.inv_level[i][d][t]
-                        # else:
-                        #     self.inv_model += lpSum(self.shipment[o][d][i][t] +
-                        #                             self.data.loc[(t, i, d)]
-                        #                             - self.shipment[d][wh][i][t]
-                        #                             + self.safety_stock[i][d][t]
-                        #                             for o in self.factory_id
-                        #                             for wh in self.wh_id) == self.inv_level[i][d][t]
+                                                    for wh in self.wh_id) >= self.inv_level[i][d][t] + self.safety_stock[i][d][t]
+
                     except KeyError:
                         continue
+
         for d in self.wh_id:
             for ind, t in enumerate(self.time_id):
                 for i in self.prod_id:
@@ -206,13 +205,8 @@ class InventoryModel():
                             self.inv_model += lpSum(self.shipment[o][d][i][prevt] +
                                                     self.inv_level[i][d][prevt] -
                                                     self.data.loc[(t, i, d)]
-                                                    + self.safety_stock[i][d][t]
-                                                    for o in self.dc_id) == self.inv_level[i][d][t]
-                        # else:
-                        #     self.inv_model += lpSum(self.shipment[o][d][i][t] +
-                        #                             self.data.loc[(t, i, d)]
-                        #                             + self.safety_stock[i][d][t]
-                        #                             for o in self.dc_id) == self.inv_level[i][d][t]
+                                                    for o in self.dc_id) >= self.inv_level[i][d][t] + self.safety_stock[i][d][t]
+
                     except KeyError:
                         continue
 
@@ -286,6 +280,11 @@ class InventoryModel():
                             prod_ind=self.prod_id,
                             variable=self.production,
                             filename="Production")
+        # self.export_vars_3d(time_ind=self.time_id,
+        #                     wh_ind=self.loc_id,
+        #                     prod_ind=self.prod_id,
+        #                     variable=self.slack,
+        #                     filename="Slack")
 
     def export_vars_3d(self, time_ind, wh_ind, prod_ind, variable, filename):
         ''' Formats the solution and returns it embedded in a pandas dataframe
@@ -343,4 +342,6 @@ TODO:
 - automate time index
 - automate removal in distance matrix
 - improve initial SS allocation
+- improve export functions (make indices argmuent list like)
+- 
 '''
