@@ -341,7 +341,6 @@ I.build_model()
 TODO:
 - automate time index
 - automate removal in distance matrix
-- improve initial SS allocation
 - improve export functions (make indices argmuent list like)
 - 
 '''
