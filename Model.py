@@ -12,7 +12,7 @@ class InventoryModel():
        qty_col: string of the column's header containing the quantity of the order
     """
 
-    def __init__(self, data_path, product_col, time_col, loc_col, qty_col):
+    def __init__(self, data_path, product_col, time_col, loc_col, qty_col, service_level):
         self.product_col = product_col
         self.time_col = time_col
         self.loc_col = loc_col
@@ -21,7 +21,7 @@ class InventoryModel():
                                              time_col,
                                              loc_col,
                                              qty_col])
-
+        self.service_level = service_level
         # column's values are converted to datetime_col objects to facilitate weekly aggregation
         self.raw_data[time_col] = pd.to_datetime(self.raw_data[time_col])
 
@@ -47,9 +47,9 @@ class InventoryModel():
             new_time_col).unique().tolist()
         self.loc_id = self.data.index.get_level_values(
             self.loc_col).unique().tolist()
-        self.factory_id = self.factory_dist.index.tolist()
-        self.dc_id = self.dc_dist.index.tolist()
-        self.wh_id = self.dc_dist.columns.tolist()
+        self.factory_id =  self.loc_data[self.loc_data["Echelon"]=="Factory"].index.tolist()
+        self.dc_id = self.loc_data[self.loc_data["Echelon"]=="DC"].index.tolist()
+        self.wh_id = self.loc_data[self.loc_data["Echelon"]=="Warehouse"].index.tolist()
 
     def define_paramaters(self, loc_data_path, demand_data_path, fact_dist, dc_dist):
         ''' Returns a dataframe of the paramaters required for the model
@@ -68,7 +68,6 @@ class InventoryModel():
                                         index_col=[0])
         self.dc_dist = pd.read_csv(dc_dist,
                                    index_col=[0])
-
     def define_variables(self):
         '''Defines the variable and their nature whcih are then added to the model
         '''
@@ -146,16 +145,17 @@ class InventoryModel():
             for ind, t in enumerate(self.time_id):
                 for i in self.prod_id:
                     prevt = self.time_id[ind - 1]
-                    if ind != 0:
-                        self.inv_model += lpSum(self.safety_stock[i][w][t]) == self.demand_stats.loc[i, (
-                            "Pallets", "std")] * 2.33 * self.weighted_avg(prevt, w, i)
+                    if ind >= self.loc_data.loc[w, "Eff. Lead Time"]:
+                        self.inv_model += lpSum(self.safety_stock[i][w][t]) >= self.loc_data.loc[w, "Eff. Lead Time"] * self.demand_stats.loc[i, (
+                            "Pallets", "std")] * self.service_level * self.weighted_avg(prevt, w, i)
 
                     else:
-                        self.inv_model += lpSum(self.safety_stock[i][w][t]) == self.demand_stats.loc[i, (
-                        "Pallets", "std")] * 2.33 * self.weighted_avg(t, w, i)
+                        self.inv_model += lpSum(self.safety_stock[i][w][t]) >= self.loc_data.loc[w, "Eff. Lead Time"] *  self.demand_stats.loc[i, (
+                        "Pallets", "std")] * self.service_level * self.weighted_avg(t, w, i)
                         try:
-                            self.inv_model += lpSum(
-                                self.data.loc[(t, i, w)] + self.safety_stock[i][w][t]) == self.inv_level[i][w][t]
+                            # self.inv_model += lpSum(
+                            #     self.data.loc[(t, i, w)] + self.safety_stock[i][w][t]) == self.inv_level[i][w][t]
+                            pass
 
                         except KeyError:
                             continue
@@ -169,13 +169,12 @@ class InventoryModel():
                     self.inv_model += lpSum((self.production[i][f][t]
                                              for i in self.prod_id)) <= self.loc_data.loc[f, "Prod. Cap."]
                     try:
-                        if ind != 0:
-                            prevt = self.time_id[ind - 1]
-                            self.inv_model += lpSum(self.inv_level[i][f][prevt] -
-                                                    self.data.loc[(t, i, f)]
-                                                    - self.shipment[f][dc][i][t]
-                                                    + self.production[i][f][t]
-                                                    for dc in self.dc_id) >= self.inv_level[i][f][t] + self.safety_stock[i][f][t]
+                        prevt = self.time_id[ind - 1]
+                        self.inv_model += lpSum(self.inv_level[i][f][prevt] -
+                                                self.data.loc[(t, i, f)]
+                                                - self.shipment[f][dc][i][t]
+                                                + self.production[i][f][t]
+                                                for dc in self.dc_id) >= self.inv_level[i][f][t] + self.safety_stock[i][f][t]
 
                     except KeyError:
                         continue
@@ -184,14 +183,14 @@ class InventoryModel():
             for ind, t in enumerate(self.time_id):
                 for i in self.prod_id:
                     try:
-                        if ind != 0:
-                            prevt = self.time_id[ind - 1]
-                            self.inv_model += lpSum(self.shipment[o][d][i][prevt] +
-                                                    self.inv_level[i][d][prevt] -
-                                                    self.data.loc[(t, i, d)]
-                                                    - self.shipment[d][wh][i][t]
-                                                    for o in self.factory_id
-                                                    for wh in self.wh_id) >= self.inv_level[i][d][t] + self.safety_stock[i][d][t]
+                        prevt = self.time_id[ind - 1]
+                        lt = self.time_id[ind - int(self.loc_data.loc[w, "Rel. Lead Time"])]
+                        self.inv_model += lpSum(self.shipment[o][d][i][lt] +
+                                                self.inv_level[i][d][prevt] -
+                                                self.data.loc[(t, i, d)]
+                                                - self.shipment[d][wh][i][t]
+                                                for o in self.factory_id
+                                                for wh in self.wh_id) >= self.inv_level[i][d][t] + self.safety_stock[i][d][t]
 
                     except KeyError:
                         continue
@@ -200,12 +199,13 @@ class InventoryModel():
             for ind, t in enumerate(self.time_id):
                 for i in self.prod_id:
                     try:
-                        if ind != 0:
-                            prevt = self.time_id[ind - 1]
-                            self.inv_model += lpSum(self.shipment[o][d][i][prevt] +
-                                                    self.inv_level[i][d][prevt] -
-                                                    self.data.loc[(t, i, d)]
-                                                    for o in self.dc_id) >= self.inv_level[i][d][t] + self.safety_stock[i][d][t]
+
+                        prevt = self.time_id[ind - 1]
+                        lt = self.time_id[ind - int(self.loc_data.loc[w, "Rel. Lead Time"])]
+                        self.inv_model += lpSum(self.shipment[o][d][i][lt] +
+                                                self.inv_level[i][d][prevt] -
+                                                self.data.loc[(t, i, d)]
+                                                for o in self.dc_id) >= self.inv_level[i][d][t] + self.safety_stock[i][d][t]
 
                     except KeyError:
                         continue
@@ -328,13 +328,16 @@ class InventoryModel():
 
 
 # Actually creating an instance of the classes in which the model is defined
-I = InventoryModel(data_path="./CSV input files/clustered_orders.csv",
-                   product_col="varvol_cluster",
-                   time_col="sh_ShipmentDate",
-                   loc_col="sh_OriginLocationMasterLocation",
-                   qty_col="Pallets")
-# calling the function that will assemble the model together
-I.build_model()
+s_levels = [2, 2.33]
+for s in s_levels:
+    I = InventoryModel(data_path="./CSV input files/unagg_orders.csv",
+                       product_col="varvol_cluster",
+                       time_col="sh_ShipmentDate",
+                       loc_col="sh_OriginLocationMasterLocation",
+                       qty_col="Pallets",
+                       service_level=s)
+    # calling the function that will assemble the model together
+    I.build_model()
 
 
 '''
