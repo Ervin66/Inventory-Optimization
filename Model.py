@@ -166,58 +166,58 @@ class InventoryModel():
  
         for f in self.factory_id:
             for ind, t in enumerate(self.time_id):
-                self.inv_model += lpSum((self.inv_level[i][f][t] 
-                                         for i in self.prod_id)) <= self.loc_data.loc[f, "Hold. Cap."]
+                self.inv_model += lpSum([self.inv_level[i][f][t] 
+                                         for i in self.prod_id]) <= self.loc_data.loc[f, "Hold. Cap."]
                 for i in self.prod_id:
                     lt = self.time_id[max(int(
                         ind - self.lt_df.loc[i, "lead_time"]), 0)]
-                    self.inv_model += lpSum((self.production[i][f][t]
-                                             for i in self.prod_id)) <= self.loc_data.loc[f, "Prod. Cap."]
+                    self.inv_model += lpSum([self.production[i][f][t]
+                                             for i in self.prod_id]) <= self.loc_data.loc[f, "Prod. Cap."]
                     prevt = self.time_id[ind - 1]
-                    self.inv_model += lpSum((self.inv_level[i][f][prevt] -
+                    self.inv_model += lpSum([self.inv_level[i][f][prevt] -
                                              self.data["Pallets"].get(
                                                  (t, i, f), 0)
                                              - self.shipment[f][dc][i][t]
                                              - self.shipment[f][w][i][t]
                                              + self.production[i][f][lt]
                                              for dc in self.dc_id
-                                             for w in self.wh_id)) >= self.inv_level[i][f][t]
+                                             for w in self.wh_id]) >= self.inv_level[i][f][t]
 
         for d in self.dc_id:
             for ind, t in enumerate(self.time_id):
-                self.inv_model += lpSum((self.inv_level[i][d][t] + self.ss_df.loc[i, "central_wh"]
-                                         for i in self.prod_id)) <= self.loc_data.loc[d, "Hold. Cap."]
+                self.inv_model += lpSum([self.inv_level[i][d][t] + self.ss_df.loc[i, "central_wh"]
+                                         for i in self.prod_id]) <= self.loc_data.loc[d, "Hold. Cap."]
                 for i in self.prod_id:
                     prevt = self.time_id[max(ind - 1, 0)]
-                    self.inv_model += lpSum((self.shipment[o][d][i][prevt] +
+                    self.inv_model += lpSum([self.shipment[o][d][i][prevt] +
                                              self.inv_level[i][d][prevt] -
                                              self.data["Pallets"].get(
                                              (t, i, d), 0)
                                              - self.shipment[d][wh][i][t]
                                              for o in self.factory_id
-                                             for wh in self.wh_id)) >= self.inv_level[i][d][t] + self.ss_df["central_wh"].get(i, 0)
+                                             for wh in self.wh_id]) >= self.inv_level[i][d][t] + self.ss_df["central_wh"].get(i, 0)
  
         for d in self.wh_id:
             for ind, t in enumerate(self.time_id):
-                self.inv_model += lpSum((self.inv_level[i][d][t] + self.ss_df.loc[i, "regional_wh"]
-                         for i in self.prod_id)) <= self.loc_data.loc[d, "Hold. Cap."]
+                self.inv_model += lpSum([self.inv_level[i][d][t] + self.ss_df.loc[i, "regional_wh"]
+                         for i in self.prod_id]) <= self.loc_data.loc[d, "Hold. Cap."]
                 for i in self.prod_id:
                     prevt = self.time_id[max(ind - 1, 0)]
-                    self.inv_model += lpSum((self.shipment[o][d][i][prevt] +
+                    self.inv_model += lpSum([self.shipment[o][d][i][prevt] +
                                              self.shipment[f][d][i][prevt] +
                                              self.inv_level[i][d][prevt] -
                                              self.data["Pallets"].get(
                                              (t, i, d), 0)
                                              for f in self.factory_id
-                                             for o in self.dc_id)) >= self.inv_level[i][d][t] + self.ss_df["regional_wh"].get(i, 0)
+                                             for o in self.dc_id]) >= self.inv_level[i][d][t] + self.ss_df["regional_wh"].get(i, 0)
 
         for o in self.factory_id + self.dc_id:
             for d in self.dc_id + self.wh_id:
                 for t in self.time_id:
-                    self.inv_model += lpSum((
+                    self.inv_model += lpSum([
                                             self.shipment[o][d][i][t] *
                                             (1 / 33)
-                                            for i in self.prod_id)) == self.FTL[o][d][t]
+                                            for i in self.prod_id]) == self.FTL[o][d][t]
         print("--- %s seconds ---" % (time.time() - start_time))
         print("constraints defined")
 
