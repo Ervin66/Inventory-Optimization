@@ -1,9 +1,11 @@
 import pandas as pd
 from pulp import *
 import ipdb
-import random
 import time
-
+# import cProfile
+# import pstats
+# import io
+import json
 
 class InventoryModel():
     """class used to define and construct the inventory linear program
@@ -14,14 +16,13 @@ class InventoryModel():
        qty_col: string of the column's header containing the quantity of the order
     """
 
-    def __init__(self, data_path, product_col, time_col, loc_col, qty_col, service_level):
+    def __init__(self, data_path, product_col, time_col, loc_col, qty_col, service_level, maxt):
         self.product_col = product_col
         self.time_col = time_col
         self.loc_col = loc_col
         self.qty_col = qty_col
-
-        self.raw_data = pd.read_csv(data_path,
-                                    nrows=500)
+        self.maxt = maxt
+        self.raw_data = pd.read_csv(data_path)
         self.service_level = service_level
         # column's values are converted to datetime_col objects to facilitate weekly aggregation
         self.raw_data[time_col] = pd.to_datetime(self.raw_data[time_col])
@@ -30,9 +31,9 @@ class InventoryModel():
         self.raw_data = self.raw_data[self.raw_data[loc_col].notna()]
 
         # privremeno
-        # v = self.raw_data[product_col].value_counts()
-        # self.raw_data = self.raw_data[self.raw_data[product_col].isin(
-        #     v.index[v.gt(1000)])]
+        v = self.raw_data[product_col].value_counts()
+        self.raw_data = self.raw_data[self.raw_data[product_col].isin(
+            v.index[v.gt(500)])]
 
         op_dic = {self.qty_col: "sum",
                   "hold_cost_pallet": "first",
@@ -57,6 +58,8 @@ class InventoryModel():
             self.product_col).unique().tolist()
         self.time_id = self.data.index.get_level_values(
             new_time_col).unique().tolist()
+        print(len(self.time_id), "-----------------")
+        self.time_id = self.time_id[:self.maxt]
         self.loc_id = self.loc_data.index
         self.factory_id = self.loc_data[self.loc_data["Echelon"]
                                         == "Factory"].index.tolist()
@@ -66,13 +69,15 @@ class InventoryModel():
                                    == "Warehouse"].index.tolist()
         # self.loc_data = self.loc_data.loc[self.loc_id]
         # self.FTL_matrix = self.FTL_matrix.drop("CoP NL", axis=1) #temp
+        self.n_orders = len(self.data.loc[self.time_id])
         print(f"Number of product: {len(self.prod_id)}" + "\n",
               f"Number of locations: {len(self.loc_id)}" + "\n", 
-              f"Number of periods: {len(self.time_id)}")
+              f"Number of periods: {len(self.time_id)}" + "\n",
+              f"Number of orders: {len(self.data.loc[self.time_id])}")
 
     def define_paramaters(self, loc_data_path, ftl_matrix):
         ''' Returns a dataframe of the paramaters required for the model
-        loc_data_path: string of the path to the location data
+        self.loc_data_path: string of the path to the location data
         '''
         self.loc_data = pd.read_csv(loc_data_path,
                                     index_col=[0])
@@ -92,11 +97,11 @@ class InventoryModel():
         self.holding_costs = self.data.groupby(
             ["sh_ItemId", "sh_OriginLocationMasterLocation"])["hold_cost_pallet"].first()
 
-        self.ss_df = self.compute_ss(self.service_level)
-
     def define_variables(self):
         '''Defines the variable and their nature whcih are then added to the model
         '''
+
+
         self.inv_level = pulp.LpVariable.dicts("inventory level",
                                                (self.prod_id,
                                                 self.loc_id,
@@ -117,7 +122,6 @@ class InventoryModel():
                                          (self.factory_id + self.dc_id,
                                           self.dc_id + self.wh_id,
                                           self.time_id),
-                                         cat="Integer",
                                          lowBound=0)
         self.production = pulp.LpVariable.dicts("production",
                                                 (self.prod_id,
@@ -135,22 +139,29 @@ class InventoryModel():
         ''' Defines the objective funciton
         '''
         start_time = time.time()
+        hc = self.holding_costs.to_dict()
+        self.loc_da = self.loc_data.to_dict()        
+        ftl = self.FTL_matrix.to_dict()
+        # holding_costs = lpSum([self.inv_level[i][w][t] * hc[(i, w)]
+        #                        for i in self.prod_id
+        #                        for w in self.loc_id
+        #                        for t in self.time_id
+        #                        if self.data.index.isin([(t, i, w)]).any()
+        #                        ])
+        holding_costs = LpAffineExpression(((self.inv_level[i][w][t], hc.get((i, w), 0))
+                                            for i in self.prod_id
+                                           for w in self.loc_id
+                                           for t in self.time_id))
 
-        holding_costs = lpSum([self.inv_level[i][w][t] * self.holding_costs.loc[i, w]
-                               for i in self.prod_id
-                               for w in self.loc_id
-                               for t in self.time_id
-                               if self.data.index.isin([(t, i, w)]).any()])
-
-        trans_costs_echelon = lpSum([self.FTL[o][d][t] * self.FTL_matrix.loc[o, d]
+        trans_costs_echelon = LpAffineExpression(((self.FTL[o][d][t], ftl[d][o])
                                      for o in self.factory_id + self.dc_id
                                      for d in self.dc_id + self.wh_id
-                                     for t in self.time_id])
+                                     for t in self.time_id))
 
-        production_costs = lpSum([self.production[i][f][t] * self.loc_data.loc[f, "Prod. Costs"]
-                                  for i in self.prod_id
-                                  for f in self.factory_id
-                                  for t in self.time_id])
+        production_costs = LpAffineExpression(((self.production[i][f][t], self.loc_da["Prod. Costs"][f])
+                                                for i in self.prod_id
+                                                for f in self.factory_id
+                                                for t in self.time_id))
 
         # slack_costs = lpSum((self.slack[i][w][t] * 50000
         #                      for i in self.prod_id
@@ -166,71 +177,68 @@ class InventoryModel():
         '''Defines the constraints to be added to the model
         '''
         start_time = time.time()
+
         constr_dic = {}
-        #create lt and pt dictionarry
-        
-        constr_dic = {f"{f,t}HoldCap": lpSum([self.inv_level[i][f][t]
-                                              for i in self.prod_id]) <= self.loc_data.loc[f, "Hold. Cap."]
+        demand = self.data["Pallets"].to_dict()
+        self.ss_df, ss = self.compute_ss(self.service_level)
+        constr_dic = {f"{f,t}HoldCap": LpAffineExpression((self.inv_level[i][f][t], 1)
+                                              for i in self.prod_id) <= self.loc_da["Hold. Cap."][f]
                       for f in self.factory_id
                       for t in self.time_id}
         
-        constr_dic.update({f"{f,t}ProdCap": lpSum([self.production[i][f][t]
-                                              for i in self.prod_id]) <= self.loc_data.loc[f, "Prod. Cap."]
-                      for f in self.factory_id
-                      for t in self.time_id})
-        constr_dic.update({ f"{w,t}HoldCap":lpSum([self.inv_level[i][w][t] + self.ss_df.loc[i, "regional_wh"]
-                                                             for i in self.prod_id]) <= self.loc_data.loc[w, "Hold. Cap."]
+        # constr_dic.update({f"{f,t}ProdCap": LpAffineExpression(((self.production[i][f][t], 1)
+
+        #                                       for i in self.prod_id)) <= self.loc_da["Prod. Cap."][f]
+        #               for f in self.factory_id
+        #               for t in self.time_id})
+        constr_dic.update({ f"{w,t}HoldCap":LpAffineExpression(((self.inv_level[x][w][t], 1)
+                                                             for x in self.prod_id)) <= self.loc_da["Hold. Cap."][w] - ss["regional_wh"][i]
+                                                                                        for i in self.prod_id
                                                                                         for w in self.wh_id
                                                                                         for t in self.time_id})
-        constr_dic.update({f"{d,t}HoldCap": lpSum([self.inv_level[i][d][t] + self.ss_df.loc[i, "central_wh"]
-                                          for i in self.prod_id]) <= self.loc_data.loc[d, "Hold. Cap."]
-                  for d in self.dc_id
-                  for t in self.time_id})
-        constr_dic.update({f"{o,d,t}FTL":lpSum([
-                                self.shipment[o][d][i][t] *
-                                (1 / 33)
-                                for i in self.prod_id]) == self.FTL[o][d][t]
+        constr_dic.update({f"{d,t}HoldCap": LpAffineExpression(((self.inv_level[x][d][t], 1)
+                                                                  for x in self.prod_id)) <= self.loc_da["Hold. Cap."][d] - ss["central_wh"][i]
+                                                                    for i in self.prod_id
+                                                                    for d in self.dc_id 
+                                                                    for t in self.time_id})
+        constr_dic.update({f"{o,d,t}FTL":LpAffineExpression(((self.shipment[o][d][i][t] ,(1 / 33))
+                                                            for i in self.prod_id)) == self.FTL[o][d][t]
                                                             for o in self.factory_id + self.dc_id
                                                             for d in self.dc_id + self.wh_id
                                                             for t in self.time_id})
 
 
-
+        lt_dic = self.lt_df["lead_time"].to_dict()
         lt = {(i,t): self.time_id[max(int(
-                ind - self.lt_df.loc[i, "lead_time"]), 0)] for i in self.prod_id
-                                                           for ind, t in enumerate(self.time_id)}    
+                ind - lt_dic[i]), 0)] for i in self.prod_id
+                                                           for ind, t in enumerate(self.time_id)}
         prevt = {(i,t) :self.time_id[max(ind - 1, 0)] for i in self.prod_id
                                                       for ind, t in enumerate(self.time_id)}
-        constr_dic.update({f"{f,t, i}1stech_InvBal":lpSum([self.inv_level[i][f][prevt[(i,t)]] -
-                                                self.data["Pallets"].get((t, i, f), 0)
-                                            - self.shipment[f][dc][i][t]
-                                            - self.shipment[f][w][i][t]
-                                            + self.production[i][f][lt[i,t]]
-                                            for dc in self.dc_id
-                                            for w in self.wh_id]) >= self.inv_level[i][f][t]
-                                            for f in self.factory_id
-                                            for i in self.prod_id
-                                            for t in self.time_id})
 
-        constr_dic.update({f"{d,t, i}2ndech_InvBal":lpSum([self.shipment[o][d][i][prevt[(i,t)]] +
-                                                self.inv_level[i][d][prevt[(i,t)]] -
-                                                self.data["Pallets"].get((t, i, d), 0)
-                                                - self.shipment[d][wh][i][t]
-                                                for o in self.factory_id
-                                                for wh in self.wh_id]) >= self.inv_level[i][d][t] + self.ss_df["central_wh"].get(i, 0)
-                                                for i in self.prod_id
-                                                for d in self.dc_id
-                                                for t in self.time_id})
+        constr_dic.update({f"{f,t, i}1stech_InvBal":LpAffineExpression([(self.inv_level[i][f][prevt[(i,t)]], 1),            
+                                                                        (self.production[i][f][lt[i,t]], 1),
+                                                                        *((self.shipment[f][dc][i][t], -1) for dc in self.dc_id),
+                                                                        *((self.shipment[f][w][i][t], -1) for w in self.wh_id)]) 
+                                                                        >= self.inv_level[i][f][t] + demand.get((t,i,f), 0)
+                                                                        for f in self.factory_id
+                                                                        for i in self.prod_id
+                                                                        for t in self.time_id})
 
-        constr_dic.update({f"{w, t, i}3rdech_InvBal":lpSum([self.shipment[o][w][i][prevt[(i,t)]] +
-                                                            self.shipment[f][w][i][prevt[(i,t)]] +
-                                                            self.inv_level[i][w][prevt[(i,t)]] -
-                                                            self.data["Pallets"].get((t, i, w), 0)
-                            for f in self.factory_id
-                            for o in self.dc_id]) >= self.inv_level[i][w][t] + self.ss_df["regional_wh"].get(i, 0)
-                                                     for i in self.prod_id
-                                                     for w in self.wh_id
-                                                     for t in self.time_id})
+        constr_dic.update({f"{d,t, i}2ndech_InvBal":LpAffineExpression([(self.inv_level[i][d][prevt[(i,t)]], 1),
+                                                                        *((self.shipment[f][d][i][prevt[(i,t)]], 1) for f in self.factory_id),
+                                                                        *((self.shipment[d][w][i][t], -1) for w in self.wh_id)
+                                                                        ]) >= self.inv_level[i][d][t] + ss["central_wh"].get(i, 0) + demand.get((t,i,d), 0)
+                                                                        for i in self.prod_id
+                                                                        for d in self.dc_id
+                                                                        for t in self.time_id})
+
+        constr_dic.update({f"{w, t, i}3rdech_InvBal":LpAffineExpression([(self.inv_level[i][w][prevt[(i,t)]], 1),
+                                                                        *((self.shipment[f][w][i][prevt[(i,t)]], 1) for f in self.factory_id),
+                                                                        *((self.shipment[d][w][i][prevt[(i,t)]], 1) for d in self.dc_id)]) 
+                                                                        >= self.inv_level[i][w][t] + ss["regional_wh"].get(i, 0) + demand.get((t,i,w), 0)
+                                                                            for i in self.prod_id
+                                                                            for w in self.wh_id
+                                                                            for t in self.time_id})
 
 
         self.inv_model.extend(constr_dic)
@@ -258,7 +266,7 @@ class InventoryModel():
         ss_rw = self.service_level * \
             (self.lt_df["lead_time"] * self.demand_stats["var"])**0.5
         ss_dic = {"central_wh": ss_cw, "regional_wh": ss_rw}
-        return pd.DataFrame(data=ss_dic, index=self.demand_stats.index)
+        return pd.DataFrame(data=ss_dic, index=self.demand_stats.index), ss_dic
 
     def build_model(self):
         ''' calls all the required function to initialize, solve and export the model
@@ -274,8 +282,9 @@ class InventoryModel():
         self.inv_model.solve(solver)
         # in case the model is not solvable display which contraint(s) are conflicting:
         solver.solverModel.parameters.conflict.display.set(2)
-        self.inv_model.writeLP("test.LP")
-        self.inv_model.writeMPS("test.mps")
+
+        # self.inv_model.writeLP("test.LP")
+        # self.inv_model.writeMPS("test.mps")
         print("Objective value: ", value(self.inv_model.objective))
         print("Inventory level:--------------")
         self.export_vars_3d(time_ind=self.time_id,
@@ -326,6 +335,7 @@ class InventoryModel():
                     dic["warehouse"].append(w)
                     dic["product"].append(i)
                     dic["value"].append(variable[i][w][t].varValue)
+
         self.var_df = pd.DataFrame.from_dict(dic)
         self.var_df = self.var_df.fillna(0)
         self.var_df.to_csv(filename + ".csv")
@@ -357,22 +367,46 @@ class InventoryModel():
 
 # Actually creating an instance of the classes in which the model is defined
 s = 1.95
-I = InventoryModel(data_path="./CSV input files/orders_abc_xyz.csv",
-                   product_col="sh_ItemId",
-                   time_col="sh_ShipmentDate",
-                   loc_col="sh_OriginLocationMasterLocation",
-                   qty_col="Pallets",
-                   service_level=s)
+time_dic = {}
+n_orders = {}
+for t in range(1, 53):
+    print(f"Current t : {t}")
+    start_time = time.time()
+    I = InventoryModel(data_path="./CSV input files/orders_abc_xyz.csv",
+                       product_col="sh_ItemId",
+                       time_col="sh_ShipmentDate",
+                       loc_col="sh_OriginLocationMasterLocation",
+                       qty_col="Pallets",
+                       service_level=s,
+                       maxt=t)
+    I.build_model()
+    time_taken = time.time() - start_time
+    time_dic[t] = time_taken
+    n_orders[I.n_orders] = time_taken
+
+print(time_dic, n_orders)
+with open('time.json', 'w') as fp:
+    json.dump(time_dic, fp)
+with open('orders.json', 'w') as fp:
+    json.dump(n_orders, fp)
 # calling the function that will assemble the model together
-I.build_model()
+# pr = cProfile.Profile()
+# pr.enable()
+
+# pr.disable()
+# s = io.StringIO()
+# ps = pstats.Stats(pr, stream=s).sort_stats('tottime')
+# ps.print_stats()
+
+# with open('test.txt', 'w+') as f:
+#     f.write(s.getvalue())
 
 
 '''
 TODO:
 - automate time index
-- automate removal in distance matrix
 - improve export functions (make indices argmuent list like)
-- 
+- generate default holding costs 
+
 '''
 
-# see how to index lead time and holding costs
