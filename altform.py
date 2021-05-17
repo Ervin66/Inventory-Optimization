@@ -22,21 +22,21 @@ class InventoryModel():
         self.loc_col = loc_col
         self.qty_col = qty_col
         self.maxt = maxt
-        self.raw_data = pd.read_csv(data_path)
+        self.raw_data = pd.read_csv(data_path,
+                                    nrows=1000)
         self.service_level = service_level
         # column's values are converted to datetime_col objects to facilitate weekly aggregation
         self.raw_data[time_col] = pd.to_datetime(self.raw_data[time_col])
 
         # remove orders that do not have a location specified
         self.raw_data = self.raw_data[self.raw_data[loc_col].notna()]
-
-        # privremeno
-        v = self.raw_data[product_col].value_counts()
-        self.raw_data = self.raw_data[self.raw_data[product_col].isin(
-            v.index[v.gt(500)])]
+         # privremeno
+        # v = self.raw_data[product_col].value_counts()
+        # self.raw_data = self.raw_data[self.raw_data[product_col].isin(
+        #     v.index[v.gt(100)])]
 
         op_dic = {self.qty_col: "sum",
-                  "hold_cost_pallet": "first",
+                  "hold_cost_pallet": "first", 
                   "lead_time": "first",
                   "std_lead_time": "first",
                   }
@@ -56,7 +56,7 @@ class InventoryModel():
         '''
         self.prod_id = self.data.index.get_level_values(
             self.product_col).unique().tolist()
-        self.time_id = self.data.index.get_level_values(
+        self.time_id = self.data.index.get_level_values(  
             new_time_col).unique().tolist()
         print(len(self.time_id), "-----------------")
         self.time_id = self.time_id[:self.maxt]
@@ -92,7 +92,7 @@ class InventoryModel():
         self.FTL_matrix = pd.read_csv(ftl_matrix,
                                       index_col=[0])
         self.lt_df = self.data.groupby(["sh_ItemId"])[
-            ["lead_time", "std_lead_time"]].first()
+            ["lead_time", "std_lead_time"]].first().fillna(0)
         self.lt_df["var_lead_time"] = self.lt_df["std_lead_time"] ** 2
         self.holding_costs = self.data.groupby(
             ["sh_ItemId", "sh_OriginLocationMasterLocation"])["hold_cost_pallet"].first()
@@ -128,7 +128,11 @@ class InventoryModel():
                                                  self.factory_id,
                                                  self.time_id),
                                                 lowBound=0)
-
+        self.lost_sales = pulp. LpVariable.dicts("lost sales",
+                                                (self.prod_id,
+                                                self.loc_id,
+                                                self.time_id),
+                                                lowBound=0)
         # self.slack = pulp.LpVariable.dicts("slack",
         #                                    (self.prod_id,
         #                                     self.loc_id,
@@ -142,13 +146,9 @@ class InventoryModel():
         hc = self.holding_costs.to_dict()
         self.loc_da = self.loc_data.to_dict()        
         ftl = self.FTL_matrix.to_dict()
-        # holding_costs = lpSum([self.inv_level[i][w][t] * hc[(i, w)]
-        #                        for i in self.prod_id
-        #                        for w in self.loc_id
-        #                        for t in self.time_id
-        #                        if self.data.index.isin([(t, i, w)]).any()
-        #                        ])
-        holding_costs = LpAffineExpression(((self.inv_level[i][w][t], hc.get((i, w), 0))
+        default_hc = self.holding_costs.groupby("sh_ItemId").mean().to_dict()
+
+        holding_costs = LpAffineExpression(((self.inv_level[i][w][t], hc.get((i, w), default_hc[i]))
                                             for i in self.prod_id
                                            for w in self.loc_id
                                            for t in self.time_id))
@@ -162,14 +162,17 @@ class InventoryModel():
                                                 for i in self.prod_id
                                                 for f in self.factory_id
                                                 for t in self.time_id))
-
+        shortage_costs = LpAffineExpression((self.lost_sales[i][w][t], 999999)
+                                            for i in self.prod_id
+                                            for w in self.loc_id
+                                            for t in self.time_id)
         # slack_costs = lpSum((self.slack[i][w][t] * 50000
         #                      for i in self.prod_id
         #                      for w in self.loc_id
         #                      for t in self.time_id))
 
         self.inv_model += holding_costs + \
-            trans_costs_echelon + production_costs  # + slack_costs
+            trans_costs_echelon + production_costs + shortage_costs  # + slack_costs
         print("--- %s seconds ---" % (time.time() - start_time))
         print("objective defined")
 
@@ -186,23 +189,21 @@ class InventoryModel():
                       for f in self.factory_id
                       for t in self.time_id}
         
-        # constr_dic.update({f"{f,t}ProdCap": LpAffineExpression(((self.production[i][f][t], 1)
+        constr_dic.update({f"{f,t}ProdCap": LpAffineExpression(((self.production[i][f][t], 1)
 
-        #                                       for i in self.prod_id)) <= self.loc_da["Prod. Cap."][f]
-        #               for f in self.factory_id
-        #               for t in self.time_id})
+                                              for i in self.prod_id)) <= self.loc_da["Prod. Cap."][f]
+                      for f in self.factory_id
+                      for t in self.time_id})
         constr_dic.update({ f"{w,t}HoldCap":LpAffineExpression(((self.inv_level[x][w][t], 1)
-                                                             for x in self.prod_id)) <= self.loc_da["Hold. Cap."][w] - ss["regional_wh"][i]
-                                                                                        for i in self.prod_id
+                                                             for x in self.prod_id)) <= self.loc_da["Hold. Cap."][w] 
                                                                                         for w in self.wh_id
                                                                                         for t in self.time_id})
         constr_dic.update({f"{d,t}HoldCap": LpAffineExpression(((self.inv_level[x][d][t], 1)
-                                                                  for x in self.prod_id)) <= self.loc_da["Hold. Cap."][d] - ss["central_wh"][i]
-                                                                    for i in self.prod_id
+                                                                  for x in self.prod_id)) <= self.loc_da["Hold. Cap."][d] 
                                                                     for d in self.dc_id 
                                                                     for t in self.time_id})
-        constr_dic.update({f"{o,d,t}FTL":LpAffineExpression(((self.shipment[o][d][i][t] ,(1 / 33))
-                                                            for i in self.prod_id)) == self.FTL[o][d][t]
+        constr_dic.update({f"{o,d,t}FTL":LpAffineExpression(((self.shipment[o][d][i][t] ,1)
+                                                                            for i in self.prod_id)) == 33 * self.FTL[o][d][t]
                                                             for o in self.factory_id + self.dc_id
                                                             for d in self.dc_id + self.wh_id
                                                             for t in self.time_id})
@@ -210,36 +211,44 @@ class InventoryModel():
 
         lt_dic = self.lt_df["lead_time"].to_dict()
         lt = {(i,t): self.time_id[max(int(
-                ind - lt_dic[i]), 0)] for i in self.prod_id
+                ind - lt_dic.get(i,1)), 0)] for i in self.prod_id
                                                            for ind, t in enumerate(self.time_id)}
-        prevt = {(i,t) :self.time_id[max(ind - 1, 0)] for i in self.prod_id
-                                                      for ind, t in enumerate(self.time_id)}
+        prevt = {t :self.time_id[max(ind - 1, 0)]  for ind, t in enumerate(self.time_id)}
 
-        constr_dic.update({f"{f,t, i}1stech_InvBal":LpAffineExpression([(self.inv_level[i][f][prevt[(i,t)]], 1),            
-                                                                        (self.production[i][f][lt[i,t]], 1),
+        inital_inv = {t:( 1 if ind>0 else 0) for ind, t in enumerate(self.time_id)}
+
+        constr_dic.update({f"{f,t, i}1stech_InvBal":LpAffineExpression(((self.production[i][f][lt[i,t]], 1),
                                                                         *((self.shipment[f][dc][i][t], -1) for dc in self.dc_id),
-                                                                        *((self.shipment[f][w][i][t], -1) for w in self.wh_id)]) 
-                                                                        >= self.inv_level[i][f][t] + demand.get((t,i,f), 0)
+                                                                        *((self.shipment[f][w][i][t], -1) for w in self.wh_id))) 
+                                                                        >= self.inv_level[i][f][t] + demand.get((t,i,f), 0) - self.lost_sales[i][f][t] - self.inv_level[i][f][prevt[t]]*inital_inv[t]
                                                                         for f in self.factory_id
                                                                         for i in self.prod_id
                                                                         for t in self.time_id})
 
-        constr_dic.update({f"{d,t, i}2ndech_InvBal":LpAffineExpression([(self.inv_level[i][d][prevt[(i,t)]], 1),
-                                                                        *((self.shipment[f][d][i][prevt[(i,t)]], 1) for f in self.factory_id),
+        constr_dic.update({f"{d,t, i}2ndech_InvBal":LpAffineExpression((*((self.shipment[f][d][i][prevt[t]], 1) for f in self.factory_id),
                                                                         *((self.shipment[d][w][i][t], -1) for w in self.wh_id)
-                                                                        ]) >= self.inv_level[i][d][t] + ss["central_wh"].get(i, 0) + demand.get((t,i,d), 0)
+                                                                        )) >= self.inv_level[i][d][t] + demand.get((t,i,d), 0) - self.lost_sales[i][d][t]- self.inv_level[i][d][prevt[t]]*inital_inv[t]
                                                                         for i in self.prod_id
                                                                         for d in self.dc_id
                                                                         for t in self.time_id})
 
-        constr_dic.update({f"{w, t, i}3rdech_InvBal":LpAffineExpression([(self.inv_level[i][w][prevt[(i,t)]], 1),
-                                                                        *((self.shipment[f][w][i][prevt[(i,t)]], 1) for f in self.factory_id),
-                                                                        *((self.shipment[d][w][i][prevt[(i,t)]], 1) for d in self.dc_id)]) 
-                                                                        >= self.inv_level[i][w][t] + ss["regional_wh"].get(i, 0) + demand.get((t,i,w), 0)
+        constr_dic.update({f"{w, t, i}3rdech_InvBal":LpAffineExpression((*((self.shipment[f][w][i][prevt[t]], 1) for f in self.factory_id),
+                                                                        *((self.shipment[d][w][i][prevt[t]], 1) for d in self.dc_id))) 
+                                                                        >= self.inv_level[i][w][t] + demand.get((t,i,w), 0)  - self.lost_sales[i][w][t]- self.inv_level[i][w][prevt[t]]*inital_inv[t]
                                                                             for i in self.prod_id
                                                                             for w in self.wh_id
                                                                             for t in self.time_id})
 
+        constr_dic.update({f"{d, t, i}2ndech_ssreq":LpAffineExpression([(self.inv_level[i][d][t], 1)]) 
+                                                                            >= ss["central_wh"].get(i, 0) 
+                                                                            for i in self.prod_id
+                                                                            for d in self.dc_id
+                                                                            for t in self.time_id})
+        constr_dic.update({f"{w, t, i}2ndech_ssreq":LpAffineExpression([(self.inv_level[i][w][t], 1)]) 
+                                                                        >= ss["regional_wh"].get(i, 0) 
+                                                                        for i in self.prod_id
+                                                                        for w in self.wh_id
+                                                                        for t in self.time_id})
 
         self.inv_model.extend(constr_dic)
 
@@ -279,7 +288,12 @@ class InventoryModel():
         self.define_objective()
         self.define_constraints()
         solver = CPLEX_PY()
-        self.inv_model.solve(solver)
+        # self.inv_model.solve(solver)
+        solver.buildSolverModel(self.inv_model)
+        solver.solverModel.parameters.emphasis.memory.set(1)
+        solver.solverModel.parameters.workmem.set(6144)
+        solver.callSolver(self.inv_model)
+        status = solver.findSolutionValues(self.inv_model)
         # in case the model is not solvable display which contraint(s) are conflicting:
         solver.solverModel.parameters.conflict.display.set(2)
 
@@ -311,6 +325,13 @@ class InventoryModel():
                             prod_ind=self.prod_id,
                             variable=self.production,
                             filename="Production")
+
+        for i in self.prod_id:
+            for t in self.time_id:
+                for l in self.loc_id:
+                    if self.lost_sales[i][l][t].varValue > 0:
+                        print((i,l,t), self.lost_sales[i][l][t].varValue)
+
         # self.export_vars_3d(time_ind=self.time_id,
         #                     wh_ind=self.loc_id,
         #                     prod_ind=self.prod_id,
@@ -367,28 +388,23 @@ class InventoryModel():
 
 # Actually creating an instance of the classes in which the model is defined
 s = 1.95
-time_dic = {}
-n_orders = {}
-for t in range(1, 53):
-    print(f"Current t : {t}")
-    start_time = time.time()
-    I = InventoryModel(data_path="./CSV input files/orders_abc_xyz.csv",
-                       product_col="sh_ItemId",
-                       time_col="sh_ShipmentDate",
-                       loc_col="sh_OriginLocationMasterLocation",
-                       qty_col="Pallets",
-                       service_level=s,
-                       maxt=t)
-    I.build_model()
-    time_taken = time.time() - start_time
-    time_dic[t] = time_taken
-    n_orders[I.n_orders] = time_taken
 
-print(time_dic, n_orders)
-with open('time.json', 'w') as fp:
-    json.dump(time_dic, fp)
-with open('orders.json', 'w') as fp:
-    json.dump(n_orders, fp)
+t=53
+time_dic = {}
+start_time = time.time()
+I = InventoryModel(data_path="./CSV input files/orders_abc_xyz.csv",
+                   product_col="sh_ItemId",
+                   time_col="sh_ShipmentDate",
+                   loc_col="sh_OriginLocationMasterLocation",
+                   qty_col="Pallets",
+                   service_level=s,
+                   maxt=t)
+I.build_model()
+time_taken = time.time() - start_time
+print("Total Time: ",time_taken)
+
+
+
 # calling the function that will assemble the model together
 # pr = cProfile.Profile()
 # pr.enable()
@@ -407,6 +423,6 @@ TODO:
 - automate time index
 - improve export functions (make indices argmuent list like)
 - generate default holding costs 
-
+- default value for holding costs
 '''
 
