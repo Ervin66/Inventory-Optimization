@@ -1,11 +1,11 @@
 import pandas as pd
+import numpy as np
 from pulp import *
 import ipdb
 import time
 # import cProfile
 # import pstats
 # import io
-import json
 
 
 class InventoryModel():
@@ -17,64 +17,65 @@ class InventoryModel():
        qty_col: string of the column's header containing the quantity of the order
     """
 
-    def __init__(self, data_path, product_col, time_col, loc_col, qty_col, service_level, maxt):
-        self.product_col = product_col
+    def __init__(self, data_path, sku_col, time_col, loc_col, qty_col, prod_col, service_level):
+        self.sku_col = sku_col
         self.time_col = time_col
         self.loc_col = loc_col
         self.qty_col = qty_col
-        self.maxt = maxt
+        self.prod_col = prod_col
         self.raw_data = pd.read_csv(data_path,
-                                    nrows=1000)
+                                    index_col=False,
+                                    nrows=500)
+
         self.service_level = service_level
         # column's values are converted to datetime_col objects to facilitate weekly aggregation
-        self.raw_data[time_col] = pd.to_datetime(self.raw_data[time_col])
+        # self.raw_data[time_col] = pd.to_datetime(self.raw_data[time_col])
 
         # remove orders that do not have a location specified
         self.data = self.raw_data[self.raw_data[loc_col].notna()]
-
          # privremeno
-        # v = self.raw_data[product_col].value_counts()
-        # self.raw_data = self.raw_data[self.raw_data[product_col].isin(
+        # v = self.raw_data[sku_col].value_counts()
+        # self.raw_data = self.raw_data[self.raw_data[sku_col].isin(
         #     v.index[v.gt(100)])]
 
-        print(self.data.groupby(product_col)[
+        print(self.data.groupby(sku_col)[
               self.qty_col].agg(Mean='mean', Sum='sum', Size="size"))
-        self.data.to_csv("demand_input.csv")
+        # self.data.to_csv("demand_input.csv")
         self.inv_model = pulp.LpProblem("Inventory_Optimization",
                                         LpMinimize)  # creates an object of an LpProblem (PuLP) to which we will assign variables, constraints and objective function
+        
 
-    def define_indices(self, new_time_col):
+    def define_indices(self, loc_data_path):
         ''' Returns the unique values for indices from the input data
         Required keywords argument:
         new_time_col: string of the aggregation basis for time (e.g. "week", "month",...)
         '''
-        self.prod_id = self.data["sh_ItemId"].unique()
+        self.loc_data = pd.read_csv(loc_data_path,
+                            index_col=[0])
+        self.sku_id = self.data[self.sku_col].unique()
         self.time_id = self.data["period"].unique()
-        self.time_id = self.time_id[:self.maxt]
-        self.loc_id = self.data["new_shOrigin"].unique()
+        self.loc_id = self.loc_data.index.tolist()
         self.factory_id = self.loc_data[self.loc_data["Echelon"]
                                         == "Factory"].index.tolist()
         self.dc_id = self.loc_data[self.loc_data["Echelon"]
                                    == "DC"].index.tolist()
         self.wh_id = self.loc_data[self.loc_data["Echelon"]
                                    == "Warehouse"].index.tolist()
-
+        self.ext_factory_id = list(set(self.data[self.prod_col].unique().tolist()) - set(self.factory_id))
         # self.loc_data = self.loc_data.loc[self.loc_id]
         # self.FTL_matrix = self.FTL_matrix.drop("CoP NL", axis=1) #temp
-        print(f"Number of product: {len(self.prod_id)}" + "\n",
+        print(f"Number of product: {len(self.sku_id)}" + "\n",
               f"Number of locations: {len(self.loc_id)}" + "\n", 
               f"Number of periods: {len(self.time_id)}" + "\n",
               f"Number of orders: {len(self.data)}")
 
-    def define_paramaters(self, loc_data_path, ftl_matrix):
+    def define_paramaters(self, ftl_matrix):
         ''' Returns a dataframe of the paramaters required for the model
         self.loc_data_path: string of the path to the location data
         '''
-        self.loc_data = pd.read_csv(loc_data_path,
-                                    index_col=[0])
 
         self.demand_stats = self.data.groupby(
-            self.product_col)[self.qty_col].agg(["size", "mean", "std"]).fillna(0)
+            self.sku_col)[self.qty_col].agg(["size", "mean", "std"]).fillna(0)
         self.demand_stats["var"] = self.demand_stats["std"]**2
         # self.demand_stats.fillna(0, inplace=True)
         self.demand_stats.to_csv("Demand Stats.csv")
@@ -88,25 +89,83 @@ class InventoryModel():
         self.holding_costs = self.data.groupby(
             ["sh_ItemId", "new_shOrigin"])["hold_cost_pallet"].first()
 
+        # assign which factory produces which sku
+        k = (self.data[self.data[self.prod_col]
+             .isin(self.factory_id)]
+             .groupby(self.prod_col)[self.sku_col]
+             .apply(set).apply(list))
+        self.prod_plan = dict(zip(k.index, k))
+
+        b = self.factory_id.copy()
+        b.remove("BRN") # all factories except BRN since already accounted for
+        brn = (self.data[(self.data[self.loc_col] == "BRN") & (self.data[self.prod_col].isin(b))]
+                .groupby(self.prod_col)[self.sku_col]
+                .apply(list).apply(set).tolist())
+        if len(brn) > 0:
+            self.f2f_sku = dict({"BRN": list(brn[0])})
+        i = self.factory_id.copy()
+        i.remove("ITT") # all factories except ITT since already accounted for
+        itt = (self.data[(self.data[self.loc_col] == "ITT") & (self.data[self.prod_col].isin(i))]
+               .groupby(self.prod_col)[self.sku_col]
+               .apply(list).apply(set).tolist())
+        if len(itt) > 0:
+            self.f2f_sku["ITT"] = list(itt[0])
+
+        if len(itt) == 0 and len(brn) == 0:
+            self.f2f_sku = {}
+
+        #assign which supplier supplies which sku
+        k = (self.data[self.data[self.prod_col]
+             .isin(self.ext_factory_id)]
+             .groupby(self.sku_col)[self.prod_col]
+             .apply(set).apply(list))
+        self.supplier = dict(zip(k.index, k))
+
+        # asssign which sku can be supplied by which factory
+        k = (self.data[self.data[self.prod_col]
+             .isin(self.factory_id)]
+             .groupby(self.sku_col)[self.prod_col]
+             .apply(set).apply(list))
+        self.sku_plan = dict(zip(k.index, k))
+
+        # subset of skus produced internally
+        self.int_skus = (self.data[self.data[self.prod_col]
+                               .isin(self.factory_id)][self.sku_col]
+                               .to_list())
+
+        # isolate demand for external skus
+        self.ext_skus = (self.data[self.data[self.prod_col]
+                               .isin(self.ext_factory_id)][self.sku_col]
+                               .to_list())
+        # extract demand to dictionary
+        self.demand = self.data.set_index([self.time_col,
+                                          self.sku_col,
+                                          self.loc_col])[self.qty_col].to_dict()
+
+
+
+        # a = self.data[(self.data["ProducedBy"].isin(self.factory_id) & self.data["new_shOrigin"].isin(self.factory_id))]
+        # a = a[a["ProducedBy"] != a["new_shOrigin"]]
+        # a.to_csv("fact_to_fact_orders.csv")
+
     def define_variables(self):
         '''Defines the variable and their nature whcih are then added to the model
         '''
 
-
         self.inv_level = pulp.LpVariable.dicts("inventory level",
-                                               (self.prod_id,
+                                               (self.sku_id,
                                                 self.loc_id,
                                                 self.time_id),
                                                lowBound=0)
         # self.max_stock = pulp.LpVariable.dicts("maxium stock level",
-        #                                        (self.prod_id,
+        #                                        (self.sku_id,
         #                                         self.loc_id,
         #                                         self.time_id),
         #                                        lowBound=0)
         self.shipment = pulp.LpVariable.dicts("shipments",
-                                              (self.loc_id,
+                                              (self.loc_id + self.ext_factory_id,
                                                self.loc_id,
-                                               self.prod_id,
+                                               self.sku_id,
                                                self.time_id),
                                               lowBound=0)
         self.FTL = pulp.LpVariable.dicts("FTL",
@@ -115,17 +174,17 @@ class InventoryModel():
                                           self.time_id),
                                          lowBound=0)
         self.production = pulp.LpVariable.dicts("production",
-                                                (self.prod_id,
+                                                (self.sku_id,
                                                  self.factory_id,
                                                  self.time_id),
                                                 lowBound=0)
         self.lost_sales = pulp. LpVariable.dicts("lost sales",
-                                                (self.prod_id,
+                                                (self.sku_id,
                                                 self.loc_id,
                                                 self.time_id),
                                                 lowBound=0)
         # self.slack = pulp.LpVariable.dicts("slack",
-        #                                    (self.prod_id,
+        #                                    (self.sku_id,
         #                                     self.loc_id,
         #                                     self.time_id),
         #                                    lowBound=0)
@@ -140,7 +199,7 @@ class InventoryModel():
         default_hc = self.holding_costs.groupby("sh_ItemId").mean().to_dict()
 
         holding_costs = LpAffineExpression(((self.inv_level[i][w][t], hc.get((i, w), default_hc[i]))
-                                            for i in self.prod_id
+                                            for i in self.sku_id
                                            for w in self.loc_id
                                            for t in self.time_id))
 
@@ -150,15 +209,15 @@ class InventoryModel():
                                      for t in self.time_id))
 
         production_costs = LpAffineExpression(((self.production[i][f][t], self.loc_da["Prod. Costs"][f])
-                                                for i in self.prod_id
+                                                for i in self.sku_id
                                                 for f in self.factory_id
                                                 for t in self.time_id))
         shortage_costs = LpAffineExpression((self.lost_sales[i][w][t], 999999)
-                                            for i in self.prod_id
+                                            for i in self.sku_id
                                             for w in self.loc_id
                                             for t in self.time_id)
         # slack_costs = lpSum((self.slack[i][w][t] * 50000
-        #                      for i in self.prod_id
+        #                      for i in self.sku_id
         #                      for w in self.loc_id
         #                      for t in self.time_id))
 
@@ -172,76 +231,97 @@ class InventoryModel():
         '''
         start_time = time.time()
 
-        factory_to_rw, cw_to_rw = self.routings_allocation()
+        factory_to_rw, cw_to_rw, fact_to_fact = self.routings_allocation()
         constr_dic = {}
-        demand = self.data["Pallets"].to_dict()
-        self.ss_df, ss = self.compute_ss(self.service_level)
-        constr_dic = {f"{f,t}HoldCap": LpAffineExpression((self.inv_level[i][f][t], 1)
-                                              for i in self.prod_id) <= self.loc_da["Hold. Cap."][f]
-                      for f in self.factory_id
-                      for t in self.time_id}
-        
-        constr_dic.update({f"{f,t}ProdCap": LpAffineExpression(((self.production[i][f][t], 1)
+        cw_ss, rw_ss = self.compute_ss(self.service_level)
 
-                                              for i in self.prod_id)) <= self.loc_da["Prod. Cap."][f]
-                      for f in self.factory_id
-                      for t in self.time_id})
-        constr_dic.update({ f"{w,t}HoldCap":LpAffineExpression(((self.inv_level[x][w][t], 1)
-                                                             for x in self.prod_id)) <= self.loc_da["Hold. Cap."][w] 
-                                                                                        for w in self.wh_id
-                                                                                        for t in self.time_id})
-        constr_dic.update({f"{d,t}HoldCap": LpAffineExpression(((self.inv_level[x][d][t], 1)
-                                                                  for x in self.prod_id)) <= self.loc_da["Hold. Cap."][d] 
-                                                                    for d in self.dc_id 
+        cw_ss, rw_ss = cw_ss["Safety_Stock"].fillna(0).to_dict(), rw_ss["Safety_Stock"].fillna(0).to_dict()
+
+
+                            
+        constr_dic.update({f"{f,t}ProdCap": LpAffineExpression(((self.production[i][f][t], 1)
+                                              for i in self.prod_plan.get(f, []))) <= self.loc_da["Prod. Cap."][f]
+                                                                                    for f in self.factory_id
+                                                                                    for t in self.time_id})
+
+        constr_dic.update({f"{w,t}HoldCap": LpAffineExpression(((self.inv_level[x][w][t], 1)
+                                                                  for x in self.sku_id)) <= self.loc_da["Hold. Cap."][w] 
+                                                                    for w in self.loc_id 
                                                                     for t in self.time_id})
+
         constr_dic.update({f"{o,d,t}FTL":LpAffineExpression(((self.shipment[o][d][i][t] ,1)
-                                                                            for i in self.prod_id)) == 33 * self.FTL[o][d][t]
+                                                                            for i in self.sku_id)) == 33 * self.FTL[o][d][t]
                                                             for o in self.factory_id + self.dc_id
                                                             for d in self.dc_id + self.wh_id
                                                             for t in self.time_id})
 
-
-        lt_dic = self.lt_df["lead_time"].to_dict()
+        lt_dic = self.data["lead_time"].to_dict()
         lt = {(i,t): self.time_id[max(int(
-                ind - lt_dic.get(i,1)), 0)] for i in self.prod_id
+                ind - lt_dic.get(i,1)), 0)] for i in self.sku_id
                                                            for ind, t in enumerate(self.time_id)}
-        prevt = {t :self.time_id[max(ind - 1, 0)]  for ind, t in enumerate(self.time_id)}
-
         inital_inv = {t:( 1 if ind>0 else 0) for ind, t in enumerate(self.time_id)}
+        prevt = {t :self.time_id[max(ind - 1, 0)]  for ind, t in enumerate(self.time_id)}
 
         constr_dic.update({f"{f,t, i}1stech_InvBal":LpAffineExpression(((self.production[i][f][lt[i,t]], 1),
                                                                         *((self.shipment[f][dc][i][t], -1) for dc in self.dc_id),
-                                                                        *((self.shipment[f][w][i][t], -1) for w in self.wh_id))) 
-                                                                        >= self.inv_level[i][f][t] + demand.get((t,i,f), 0) - self.lost_sales[i][f][t] - self.inv_level[i][f][prevt[t]]*inital_inv[t]
+                                                                        *((self.shipment[f][w][i][t], -1) for w in self.wh_id)))
+                                                                        == self.inv_level[i][f][t] + self.demand.get((t,i,f), 0) - self.lost_sales[i][f][t] - self.inv_level[i][f][prevt[t]]*inital_inv[t]
                                                                         for f in self.factory_id
-                                                                        for i in self.prod_id
+                                                                        for i in self.prod_plan.get(f, [])
                                                                         for t in self.time_id})
 
-        constr_dic.update({f"{d,t, i}2ndech_InvBal":LpAffineExpression((*((self.shipment[f][d][i][prevt[t]], 1) for f in self.factory_id),
-                                                                        *((self.shipment[d][w][i][t], -1) for w in self.wh_id)
-                                                                        )) >= self.inv_level[i][d][t] + demand.get((t,i,d), 0) - self.lost_sales[i][d][t]- self.inv_level[i][d][prevt[t]]*inital_inv[t]
-                                                                        for i in self.prod_id
+        constr_dic.update({f"{x,t,i}1stehch_facttofact_InvBal": LpAffineExpression([*((self.shipment[f][x][i][prevt[t]], 1) for f in self.sku_plan[i])]) 
+                                                                                    == self.inv_level[i][x][t] + self.demand.get((t,i,x), 0) - self.lost_sales[i][x][t] - self.inv_level[i][x][prevt[t]]*inital_inv[t]
+                                                                                    for x in self.f2f_sku.keys()
+                                                                                    for i in self.f2f_sku[x]
+                                                                                    for t in self.time_id})
+
+        constr_dic.update({f"{d,t, i}2ndech_InvBal":LpAffineExpression((*((self.shipment[f][d][i][prevt[t]], 1) for f in self.sku_plan[i]),
+                                                                        *((self.shipment[d][w][i][t], -1) for w in self.wh_id if d in cw_to_rw[w])))
+                                                                        == self.inv_level[i][d][t] + self.demand.get((t,i,d), 0) + cw_ss.get((d, i), 0) - self.lost_sales[i][d][t]- self.inv_level[i][d][prevt[t]]*inital_inv[t]
+                                                                        for i in self.int_skus
                                                                         for d in self.dc_id
                                                                         for t in self.time_id})
 
         constr_dic.update({f"{w, t, i}3rdech_InvBal":LpAffineExpression((*((self.shipment[f][w][i][prevt[t]], 1) for f in factory_to_rw[w]),
-                                                                        *((self.shipment[d][w][i][prevt[t]], 1) for d in cw_to_rw[w]))) 
-                                                                        >= self.inv_level[i][w][t] + demand.get((t,i,w), 0)  - self.lost_sales[i][w][t] - self.inv_level[i][w][prevt[t]]*inital_inv[t]
-                                                                            for i in self.prod_id
+                                                                        *((self.shipment[d][w][i][prevt[t]], 1) for d in cw_to_rw[w])))  
+                                                                         == self.inv_level[i][w][t] + self.demand.get((t,i,w), 0) + rw_ss.get((w,i), 0) - self.lost_sales[i][w][t] - self.inv_level[i][w][prevt[t]]*inital_inv[t]
+                                                                            for i in self.int_skus
                                                                             for w in self.wh_id
                                                                             for t in self.time_id})
 
-        constr_dic.update({f"{d, t, i}2ndech_ssreq":LpAffineExpression([(self.inv_level[i][d][t], 1)]) 
-                                                                            >= ss["central_wh"].get(i, 0) - self.lost_sales[i][d][t]
-                                                                            for i in self.prod_id
-                                                                            for d in self.dc_id
-                                                                            for t in self.time_id})
-        constr_dic.update({f"{w, t, i}2ndech_ssreq":LpAffineExpression([(self.inv_level[i][w][t], 1)]) 
-                                                                        >= ss["regional_wh"].get(i, 0) - self.lost_sales[i][w][t]
-                                                                        for i in self.prod_id
+        constr_dic.update({f"{f,t,i}1stech_ext_sku_InvBal": LpAffineExpression([*((self.shipment[e][f][i][prevt[t]], 1) for e in self.supplier[i])])
+                                                                        == self.demand.get((t,i,f), 0) - self.lost_sales[i][f][t] + self.inv_level[i][f][t] - self.inv_level[i][f][prevt[t]]*inital_inv[t]
+                                                                        for i in self.ext_skus
+                                                                        for f in self.factory_id
+                                                                        for t in self.time_id}) # teest
+
+        constr_dic.update({f"{d,t,i}2ndech_ext_sku_InvBal": LpAffineExpression((*((self.shipment[e][d][i][prevt[t]], 1) for e in self.supplier[i]),
+                                                                               *((self.shipment[d][w][i][t], -1) for w in self.wh_id if d in cw_to_rw[w])))
+                                                                        == self.demand.get((t,i,d), 0) + cw_ss.get((d, i), 0) - self.lost_sales[i][d][t] + self.inv_level[i][d][t] - self.inv_level[i][d][prevt[t]]*inital_inv[t]
+                                                                        for i in self.ext_skus
+                                                                        for d in self.dc_id
+                                                                        for t in self.time_id})
+
+
+        constr_dic.update({f"{w,t,i}3rdech_ext_sku_InvBal": LpAffineExpression((*((self.shipment[e][w][i][prevt[t]], 1) for e in self.supplier[i]),
+                                                                               *((self.shipment[d][w][i][prevt[t]], 1) for d in cw_to_rw[w])))
+                                                                        == self.demand.get((t,i,w), 0) + rw_ss.get((w,i), 0) - self.lost_sales[i][w][t] + self.inv_level[i][w][t] - self.inv_level[i][w][prevt[t]]*inital_inv[t]
+                                                                        for i in self.ext_skus
                                                                         for w in self.wh_id
                                                                         for t in self.time_id})
 
+        constr_dic.update({f"{d, t, i}2ndech_ssreq":LpAffineExpression([(self.inv_level[i][d][t], 1)]) 
+                                                                            >= cw_ss.get((d, i), 0) - self.lost_sales[i][d][t]
+                                                                            for i in self.sku_id
+                                                                            for d in self.dc_id
+                                                                            for t in self.time_id})
+
+        constr_dic.update({f"{w, t, i}3rdech_ssreq":LpAffineExpression([(self.inv_level[i][w][t], 1)]) 
+                                                                        >= rw_ss.get((w,i), 0) - self.lost_sales[i][w][t]
+                                                                        for i in self.sku_id
+                                                                        for w in self.wh_id
+                                                                        for t in self.time_id})
         self.inv_model.extend(constr_dic)
 
         print("--- %s seconds ---" % (time.time() - start_time))
@@ -287,13 +367,13 @@ class InventoryModel():
         rw_ss.set_index(["Location", "sh_ItemId"], inplace=True)
         rw_ss.columns = ["Pallets_mean", "Pallets_std", "lead_time_mean", "lead_time_std"] # renaming the columns
         rw_ss["Safety_Stock"] = self.service_level * (rw_ss["lead_time_mean"] * rw_ss["Pallets_std"]**2)
-        ipdb.set_trace()
 
         return cw_ss, rw_ss
 
     def routings_allocation(self):
         factory_to_rw = {}
         cw_to_rw = {}
+        fact_to_fact = {}
         for w in self.wh_id:
             factory_to_rw[w] = self.loc_data.loc[w, "Factory_allocation"].split(",")
             
@@ -301,16 +381,20 @@ class InventoryModel():
                 cw_to_rw[w] = self.loc_data.loc[w, "Resp. Central WH"].split(",")
             except AttributeError:
                 cw_to_rw[w]  = []
-        return factory_to_rw, cw_to_rw
+        for f in self.factory_id:
+            try:
+                fact_to_fact[f] = self.loc_data.loc[f, "Factory_to_Factory"].split(",")
+            except AttributeError:
+                fact_to_fact[f] = []
+
+        return factory_to_rw, cw_to_rw, fact_to_fact
 
     def build_model(self):
         ''' calls all the required function to initialize, solve and export the model
         '''
-
-        self.define_paramaters(loc_data_path="./CSV input files/wh_data_edited.csv",
-                               ftl_matrix="./CSV input files/FTLmatrix.csv")
-        self.define_indices(new_time_col="week")
-
+        self.define_indices(loc_data_path="./CSV input files/wh_data_edited.csv")
+        self.define_paramaters(ftl_matrix="./CSV input files/FTLmatrix.csv")
+        
         start_time = time.time()
         self.define_variables()
         self.define_objective()
@@ -334,37 +418,33 @@ class InventoryModel():
         print("Inventory level:--------------")
         self.export_vars_3d(time_ind=self.time_id,
                             wh_ind=self.loc_id,
-                            prod_ind=self.prod_id,
+                            prod_ind=self.sku_id,
                             variable=self.inv_level,
                             filename="Inventory Level")
         print("Shipments:------------------")
         self.export_vars_4d(time_ind=self.time_id,
-                            origin_ind=self.loc_id,
+                            origin_ind=self.loc_id + self.ext_factory_id,
                             destination_ind=self.loc_id,
-                            prod_ind=self.prod_id,
+                            prod_ind=self.sku_id,
                             variable=self.shipment,
                             filename="Shipment")
-        # print("Full Truck Loads:-----------")
-        # self.export_vars_3d(time_ind=self.time_id,
-        #                     wh_ind=self.loc_id,
-        #                     prod_ind=self.loc_id,
-        #                     variable=self.FTL,
-        #                     filename="FTL")
+
         print("Production:-----------------")
         self.export_vars_3d(time_ind=self.time_id,
                             wh_ind=self.factory_id,
-                            prod_ind=self.prod_id,
+                            prod_ind=self.sku_id,
                             variable=self.production,
                             filename="Production")
+        print("Lost Sales:-----------------")
         self.export_vars_3d(time_ind=self.time_id,
                             wh_ind=self.factory_id,
-                            prod_ind=self.prod_id,
+                            prod_ind=self.sku_id,
                             variable=self.lost_sales,
                             filename="Lost Sales")
 
         # self.export_vars_3d(time_ind=self.time_id,
         #                     wh_ind=self.loc_id,
-        #                     prod_ind=self.prod_id,
+        #                     prod_ind=self.sku_id,
         #                     variable=self.slack,
         #                     filename="Slack")
 
@@ -393,7 +473,7 @@ class InventoryModel():
         print(self.var_df)
         print("--- %s seconds ---" % (time.time() - start_time))
         print(f"{filename} exported")
-
+                   
     def export_vars_4d(self, time_ind, origin_ind, destination_ind, prod_ind, variable, filename):
         start_time = time.time()
         dic = {"time": [], "origin": [],
@@ -402,16 +482,24 @@ class InventoryModel():
             for o in origin_ind:
                 for d in destination_ind:
                     for i in prod_ind:
-                        dic["origin"].append(o)
-                        dic["destination"].append(d)
-                        dic["product"].append(i)
-                        dic["time"].append(t)
-                        dic["value"].append(variable[o][d][i][t].varValue)
+                        if variable[o][d][i][t].varValue is not None:
+                            if variable[o][d][i][t].varValue > 0:
+                                dic["origin"].append(o)
+                                dic["destination"].append(d)
+                                dic["product"].append(i)
+                                dic["time"].append(t)
+                                dic["value"].append(variable[o][d][i][t].varValue)
+
         self.var_df = pd.DataFrame.from_dict(dic)
         self.var_df = self.var_df.fillna(0)
-        self.var_df = self.var_df[self.var_df["value"] > 0]
         self.var_df.to_csv(filename + ".csv")
+        self.FTL_df = self.var_df.groupby(["origin", "destination", "time"], as_index=True).sum()
+        self.FTL_df.value = self.FTL_df.value / 33
+        self.FTL_df.value = np.ceil(self.FTL_df.value)
+        self.FTL_df.to_csv("FTL.csv")
         print(self.var_df)
+        print("FTL----------------------")
+        print(self.FTL_df)
         print("--- %s seconds ---" % (time.time() - start_time))
         print(f"{filename} exported")
 
@@ -426,12 +514,12 @@ solvtime_dic = {}
 start_time = time.time()
  
 I = InventoryModel(data_path="./CSV input files/orders_newloc.csv",
-                   product_col="sh_ItemId",
+                   sku_col="sh_ItemId",
                    time_col="period",
                    loc_col="new_shOrigin",
                    qty_col="Pallets",
-                   service_level=s,
-                   maxt=t)
+                   prod_col="ProducedBy",
+                   service_level=s)
 I.build_model()
 
 
@@ -460,3 +548,4 @@ TODO:
 - generate default holding costs
 - default value for holding costs
 '''
+

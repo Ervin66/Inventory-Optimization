@@ -35,7 +35,7 @@ orders["internal_ship"] = orders["ShipToID"].map(wh_address)
 orders["internal_ship"].fillna("Client", inplace=True)
 orders["internal_ship"][orders["internal_ship"] == orders["sh_OriginLocationMasterLocation"]
                         ] = "Client"  # if orgin=destination treat it as a normal order
-fact = ["BRN", "VES", "BAB", "DOM", "DOM buffer", "ITT", "ITT buffer", "DOE"]
+fact = ["BRN", "VES", "BAB", "DOM", "DOM buffer", "ITT", "ITT buffer", "DOE", "SHO", "DUN"]
 orders["internal_ship"][orders["internal_ship"] == "IIT buffer"] = "ITT"
 
 
@@ -58,6 +58,7 @@ operation = {"sh_18_Ln_PalletsEquivalent": "sum",
 orders["sh_ShipmentDate"] = pd.to_datetime(
     orders["sh_ShipmentDate"],
     format="%d/%m/%Y")  # converting dates to datetime objects
+
 
 
 
@@ -227,8 +228,7 @@ def ABC_segmentation(perc):
         return 'C'
 
 
-test_agg["AddCost"] = test_agg["sh_18_Ln_PalletsEquivalent"] * \
-    test_agg["inv_costs_20"]
+test_agg["AddCost"] = test_agg["sh_18_Ln_PalletsEquivalent"] 
 
 test_agg = test_agg.sort_values(by=["AddCost"], ascending=False)
 test_agg["CumCost"] = test_agg["AddCost"].cumsum()
@@ -275,14 +275,63 @@ test["Safety Stock_0.98"][(test["ABC_cluster"] == "C") & (test["XYZ_cluster"]=="
 test["Total Inventory"] = test["sh_18_Ln_PalletsEquivalent"] + \
     test["Safety Stock_0.98"].fillna(
     0)  # add demand from orders with SS for weekly inventory
- 
-uniq_skuloc = test.groupby("sh_ItemId")["sh_OriginLocationMasterLocation"].apply(set).to_dict()
+allperiod = test["period"].unique()
+combs = []
+for a, b in zip(test["sh_ItemId"], test["sh_OriginLocationMasterLocation"]):
+    for t in allperiod:
+        combs.append((a,b,t))
 
-print(list(uniq_skuloc.keys())[0])
+# index = pd.MultiIndex.from_product([test["sh_ItemId"].unique(), test["sh_OriginLocationMasterLocation"].unique(), test["period"].unique()])
+# test = test.set_index(["sh_ItemId", "sh_OriginLocationMasterLocation", "period"])
+# result = test.unstack(fill_value=0).stack().reset_index()
+ss_ass = dict(zip(zip(test["sh_ItemId"], test["sh_OriginLocationMasterLocation"]), test["Safety Stock_0.98"]))
+inv_cost_ass = dict(zip(zip(test["sh_ItemId"], test["sh_OriginLocationMasterLocation"]), test["inv_costs_20"]))
+allskus = test["sh_ItemId"].unique()
 
-ipdb.set_trace()
-test.set_index(["period", "sh_ItemId", "sh_GIFC", ""])
+abc_clust = dict(zip(test["sh_ItemId"], test["ABC_cluster"]))
+xyz_clust = dict(zip(test["sh_ItemId"], test["XYZ_cluster"]))
+perc = dict(zip(zip(test["sh_ItemId"], test["sh_OriginLocationMasterLocation"]), test["perc_supplied_indirect"]))
+dic_df = test.set_index(["sh_ItemId", "sh_OriginLocationMasterLocation", "period"]).to_dict()
+
+for c in combs:
+    if c not in dic_df["sh_18_Ln_PalletsEquivalent"]:
+        dic_df["sh_18_Ln_PalletsEquivalent"][c] = 0
+        dic_df["Safety Stock_0.98"][c] = ss_ass[c[0:2]]
+        dic_df["Total Inventory"][c] = ss_ass[c[0:2]]
+        dic_df["inv_costs_20"][c] = inv_cost_ass[c[0:2]]
+        dic_df["perc_supplied_indirect"][c] = perc[c[0:2]]
+        dic_df["ABC_cluster"][c] = abc_clust[c[0]]
+        dic_df["XYZ_cluster"][c] = xyz_clust[c[0]]
+
+test = pd.DataFrame.from_dict(dic_df)
+test = test.reset_index()
+# test.rename(columns={"level_0": "sh_ItemId", "level_1": "sh_OriginLocationMasterLocation", "level_2": "period"}, inplace=True)
+# test.sort_values(by=["sh_ItemId", "sh_OriginLocationMasterLocation"], inplace=True, axis=1)
+print(test)
 test.to_csv("inventory final.csv")
 
 
 
+batch = pd.read_csv("PPF Batch Size.csv",
+                    index_col=False)
+print(batch)
+
+batch = dict(zip(batch["sh_ItemId"], batch["Min. Batch Size (PAL)"]))
+
+def min_batch(qty, sku):
+
+    if qty > 0 and qty < batch[sku]:
+        return batch[sku]
+    else:
+        return qty
+
+
+test["sh_18_Ln_PalletsEquivalent"][test["level_1"] == test["ProducedBy"]] = np.vectorize(min_batch)(test["sh_18_Ln_PalletsEquivalent"], test["level_0"])
+test["Total Inventory"] = test["sh_18_Ln_PalletsEquivalent"] + test["Safety Stock_0.98"].fillna(0)
+a = np.vectorize(min_batch)(test["sh_18_Ln_PalletsEquivalent"], test["level_0"])
+
+test["inv_costs_20"][test["Total Inventory"] == 0] = 0
+
+ipdb.set_trace()
+
+print("bla")
