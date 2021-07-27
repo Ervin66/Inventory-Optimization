@@ -7,6 +7,7 @@ import os
 import visualisation as v
 import ujson
 import collections
+from collections import defaultdict
 import re
 import configparser, os.path, argparse
 # import gurobipy
@@ -35,7 +36,7 @@ class InventoryModel():
         d = {sku_col: "object"}
         self.raw_data = pd.read_csv(self.config_dict["filenames"]["orders"],
                                     index_col=[0],
-                                    nrows=100,
+                                    nrows=3000,
                                     dtype=d)
 
         self.service_level = float(self.config_dict["model"]["service_level"])
@@ -405,13 +406,20 @@ class InventoryModel():
                                                lowBound=0)
         dep = self.departure_allocation()
 
-        self.ship_idx = [(o,d,i,t) for o in (self.factory_id + self.cw_id + self.ext_factory_id) for d in dep.get(o,[]) for i in (self.sku_LOC.get(o, [])) for t in self.time_id]
+        origins = self.factory_id + self.cw_id + self.ext_factory_id
+        #  self.ship_idx = [(o,d,i,t) for o in (self.factory_id + self.cw_id + self.ext_factory_id) for d in dep.get(o,[]) for i in (self.sku_LOC.get(o, [])) for t in self.time_id]
+        self.ship_idx = [(o, d, i, t) for i, d, t in self.inv_idx for o in origins if i in self.sku_LOC.get(o, []) and d in dep.get(o, [])]
 
-
+        ipdb.set_trace()
         self.shipment = pulp.LpVariable.dicts("shipments",
                                               self.ship_idx,
                                               lowBound=0)
         self.ftl_idx = [(o,d,t) for o,d,i,t in self.ship_idx]
+        self.sum_idx = defaultdict(list)
+        for a in self.ship_idx:
+            k = (a[0], a[1], a[3])
+            self.sum_idx[k].append(a[2])
+
         self.FTL = pulp.LpVariable.dicts("FTL",
                                          self.ftl_idx,
                                          lowBound=0)
@@ -477,7 +485,7 @@ class InventoryModel():
                                                                     for x, w, t in self.inv_idx})
 
         constr_dic.update({f"{o,d,t}FTL":LpAffineExpression(((self.shipment[(o,d,i,t)] ,1)
-                                                                            for i in self.sku_LOC.get(o, []))) == 33 * self.FTL[(o,d,t)]
+                                                                            for i in self.sum_idx.get((o,d,t), []))) == 33 * self.FTL[(o,d,t)]
                                                             for o,d,x,t in self.ship_idx})
 
         lt_dic = self.data["lead_time"].to_dict()
@@ -488,7 +496,7 @@ class InventoryModel():
         prevt = {t :self.time_id[ind-1]  for ind, t in enumerate(self.time_id)}
 
         constr_dic.update({f"{f,t, i}1stech_InvBal":LpAffineExpression(((self.production[(i,f,lt[i,t])], 1),
-                                                                        *((self.shipment[(f,w,i,t)] , -1) for w in dep[f])))
+                                                                        *((self.shipment[(f,w,i,t)] , -1) for w in dep[f] if i in self.sku_LOC.get(w, []))))
                                                                         == self.inv_level[(i,f,t)] + self.demand.get((t,i,f), 0) - self.lost_sales.get((t,i,f), 0)- self.inv_level[(i,f,prevt[t])]*inital_inv[t]
                                                                         for f in self.factory_id
                                                                         for i in self.intsku_fact.get(f, []) 
@@ -500,14 +508,14 @@ class InventoryModel():
                                                                 for i in self.f2f_sku.get(f, []) 
                                                                 for t in self.time_id})
         p = [(i,w) for w in self.loc_id for i in self.sku_LOC.get(w, []) if (self.cw_ss.get((w, i), self.rw_ss.get((w, i), 0)) + self.demand.get((self.time_id[1],i,w), 0)) > 0]
-        constr_dic.update({f"{w,t, i}initial":LpAffineExpression([(self.inv_level[(i,w,t)], 1)])
+        constr_dic.update({f"{w,t, i}initial":LpAffineExpression([(self.inv_level[(i, w, t)], 1)])
                                                                   ==  self.cw_ss.get((w, i), self.rw_ss.get((w, i), 0)) + self.demand.get((self.time_id[1],i,w), 0)
                                                                         for i,w in p
                                                                         for t in self.time_id[:1]})
 
 
         constr_dic.update({f"{d,t, i}2ndech_InvBal":LpAffineExpression((*((self.shipment[(f,d,i,prevt[t])], 1) for f in self.sku_plan[i]),
-                                                                        *((self.shipment[(d,w,i,t)], -1) for w in self.rw_id if d in cw_to_rw[w])))
+                                                                        *((self.shipment[(d,w,i,t)], -1) for w in self.rw_id if d in cw_to_rw[w] and i in self.sku_LOC.get(w, []))))
                                                                         == self.inv_level[(i,d,t)] + self.demand.get((t,i,d), 0) - self.lost_sales.get((t,i,d), 0)- self.inv_level[(i,d,prevt[t])]*inital_inv[t]
                                                                         for d in self.cw_id                 
                                                                         for i in self.intsku_CW.get(d,[])
@@ -529,7 +537,7 @@ class InventoryModel():
                                                                         for t in self.time_id[1:]}) 
 
         constr_dic.update({f"{d,t,i}2ndech_ext_sku_InvBal": LpAffineExpression((*((self.shipment[(e,d,i,prevt[t])], 1) for e in self.supplier[i]),
-                                                                               *((self.shipment[(d,w,i,t)], -1) for w in self.rw_id if d in cw_to_rw[w])))
+                                                                               *((self.shipment[(d,w,i,t)], -1) for w in self.rw_id if d in cw_to_rw[w] and i in self.sku_LOC.get(w, []))))
                                                                         == self.demand.get((t,i,d), 0) - self.lost_sales.get((t,i,d), 0) + self.inv_level[(i,d,t)] - self.inv_level[(i,d,prevt[t])]*inital_inv[t]
                                                                         for d in self.cw_id
                                                                         for i in self.extsku_CW.get(d,[])
@@ -630,6 +638,8 @@ class InventoryModel():
         last_t = {k: self.time_id.index(v)
                   for k, v in last_t.items()}
         return last_t
+    def find_last_t(self):
+        pass
 
     def compute_big_M(self, demand, mbs):
         temp = demand.groupby([self.sku_col, self.time_col]).agg({self.qty_col: "sum"})
@@ -1005,5 +1015,3 @@ print("Total Time: ", time_taken)
 
 # with open('test.txt', 'w+') as f:
 #     f.write(s.getvalue())
-
-
