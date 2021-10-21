@@ -1,7 +1,6 @@
 import pandas as pd
 import numpy as np
 from pulp import *
-import ipdb
 import time
 import os
 import visualisation as v
@@ -11,10 +10,7 @@ from collections import defaultdict
 import re
 import configparser, os.path, argparse
 from statistics import NormalDist
-# import gurobipy
-# import cProfile
-# import pstats
-# import io
+
 
 
 class InventoryModel():
@@ -36,44 +32,36 @@ class InventoryModel():
         self.loc_col = loc_col
         self.qty_col = qty_col
         self.prod_col = prod_col
+        self.decimal = self.config_dict["filenames"]["decimal"]
         d = {sku_col: "object"}
         self.raw_data = pd.read_csv(self.config_dict["filenames"]["orders"],
                                     index_col=[0],
-                                    nrows=1000,
+                                    nrows=20000,
                                     dtype=d,
                                     sep=None,
-                                    engine="python")
+                                    engine="python",
+                                    decimal=self.decimal)
 
-        self.service_level = float(self.config_dict["model"]["service_level"])
+        self.service_level = NormalDist().inv_cdf(float(self.config_dict["model"]["service_level"]))
         self.ftl_matrix_path = self.config_dict["filenames"]["ftl_matrix"]
         self.batch_size_path = self.config_dict["filenames"]["batch_size"]
         self.loc_data_path = self.config_dict["filenames"]["location_data"]
 
-        # column's values are converted to datetime_col objects to facilitate weekly aggregation
-        # self.raw_data[time_col] = pd.to_datetime(self.raw_data[time_col])
 
         # remove orders that do not have a location specified
         self.data = self.raw_data[self.raw_data[loc_col].notna()]
-        # self.data = self.data["XYZ_cluster"].fillna("Z")
 
-        # self.data = self.data[self.data["sh_ItemId"] == "2C700000000173"]
         self.writer = pd.ExcelWriter(self.config_dict["filenames"]["result_file"], engine="xlsxwriter")
         if not os.path.exists("CSV export files"):
             os.makedirs("CSV export files")
         if not os.path.exists("Saved Models"):
             os.makedirs("Saved Models")
 
-        # privremeno
-        # v = self.raw_data[sku_col].value_counts()
-        # self.raw_data = self.raw_data[self.raw_data[sku_col].isin(
-        #     v.index[v.gt(100)])]
         try:
             self.data["XYZ_cluster"] = self.data["XYZ_cluster"].fillna("Z")
             self.data = self.data.loc[~((self.data["ABC_cluster"] == "C") & (self.data["XYZ_cluster"] == "Z"))]
         except KeyError:
             print("No clusters columns found")
-        # self.data = self.data.groupby(["sh_ItemId", "new_shOrigin"]).filter(lambda x: len(x) > 10)
-##        self.data = self.data.sample(frac=0.25)
         self.data.to_excel(self.writer, sheet_name="Demand")
         self.data.to_csv("./CSV export files/Demand.csv")
         print(self.data)
@@ -231,7 +219,7 @@ class InventoryModel():
         for d, i in p:
             if constraints[f"('{d}', '{t_}', '{i}')2ndech_ssreq"].constant != - self.cw_ss[(d, i)]:
                 new_ss = - self.cw_ss[(d, i)]
-                for t in self.time_id[1:last_t[i]]:
+                for t in self.time_id[:last_t[i]]:
                     constraints[f"('{d}', '{t}', '{i}')2ndech_ssreq"].constant = new_ss
                     cons_modified["Min. Inv."] += 1
 
@@ -244,7 +232,7 @@ class InventoryModel():
         for w, i in p:
             if constraints[f"('{w}', '{t_}', '{i}')3rdech_ssreq"].constant != - self.rw_ss[(w, i)]:
                 new_ss = - self.rw_ss[(w, i)]
-                for t in self.time_id[1:last_t[i]]:
+                for t in self.time_id[:last_t[i]]:
                     constraints[f"('{w}', '{t}', '{i}')3rdech_ssreq"].constant = new_ss
                     cons_modified["Min. Inv."] += 1
 
@@ -272,7 +260,8 @@ class InventoryModel():
         self.loc_data = pd.read_csv(loc_data_path,
                             index_col=[0],
                             sep=None,
-                            engine="python")
+                            engine="python",
+                            decimal=self.decimal)
         self.sku_id = self.data[self.sku_col].unique()  # Set of all SKUs I
         self.time_id = self.data[self.time_col].unique().tolist()  # Set of all time periods T
         self.time_id.insert(0,"0")  # create t=0 index
@@ -382,14 +371,13 @@ class InventoryModel():
         self.demand_stats = self.data.groupby(
             self.sku_col)[self.qty_col].agg(["size", "mean", "std"]).fillna(0)
         self.demand_stats["var"] = self.demand_stats["std"]**2
-        # self.demand_stats.fillna(0, inplace=True)
         self.demand_stats.to_csv("Demand Stats.csv")
-        # self.leadt_data = self.raw_data([self.product_col, self.loc_col])["Effective Lead Time [weeks]" , ""].first()
-        # self.holding_costs =self.raw_data([])
+
         self.FTL_matrix = pd.read_csv(ftl_matrix_path,
                                       index_col=[0],
                                       sep=None,
-                                      engine="python")
+                                      engine="python",
+                                      decimal=self.decimal)
         # putting different parametrs into dictionaries
         self.lt_df = self.data.groupby([self.sku_col])[
             ["lead_time", "std_lead_time"]].first().fillna(0)
@@ -450,7 +438,8 @@ class InventoryModel():
 
         self.FTL = pulp.LpVariable.dicts("FTL",
                                          self.ftl_idx,
-                                         lowBound=0)
+                                         lowBound=0,
+                                         cat="Integer")
         self.prod_idx = [(i,f,t) for f in self.factory_id for i in self.intsku_fact.get(f, [] ) for t in self.time_id[:last_t[i] + 1]]
         self.production = pulp.LpVariable.dicts("production",
                                                 self.prod_idx,
@@ -485,7 +474,6 @@ class InventoryModel():
             shortage_costs = LpAffineExpression((self.lost_sales[i], int(costs["short_costs"]))
                                                 for i in self.ls_idx)
 
-
         # slack_costs = LpAffineExpression(((self.slack[(w, t)], 9999)
         #                                          for w in self.loc_id
         #                                          for t in self.time_id))
@@ -500,11 +488,11 @@ class InventoryModel():
         Constraints are consturcted and added to constr_dic
         constr_dic is the passed to be added as constraints to LpProblem object
         '''
-        last_t = self.find_last_t()
+        last_t = self.find_last_t()  # for each sku store last time period where demand occurs
 
-        factory_to_rw, cw_to_rw, fact_to_fact = self.arrival_allocation()
-        dep = self.departure_allocation()
-        self.sku_LOC = self.union_subset()
+        factory_to_rw, cw_to_rw, fact_to_fact = self.arrival_allocation()  # store allowed shiments destination
+        dep = self.departure_allocation()  # store allowed shipment departure
+        self.sku_LOC = self.union_subset()  # for each facility which sku should be held there
         constr_dic = {}
                
         constr_dic.update({f"{f,t}ProdCap": LpAffineExpression(((self.production[(i, f, t)], 1)
@@ -524,11 +512,10 @@ class InventoryModel():
         lt = {(i,t): self.time_id[max(int(ind - lt_dic.get(i,1)), ind-1)]
                                     for i in self.sku_id
                                     for ind, t in enumerate(self.time_id)} # store lead time for each sku
-        inital_inv = {t:( 1 if ind>0 else 0) for ind, t in enumerate(self.time_id)} # dummy binary variable
-        prevt = {t :self.time_id[ind-1]  for ind, t in enumerate(self.time_id)}
+        prevt = {t :self.time_id[ind-1]  for ind, t in enumerate(self.time_id)}  # store the previous chronological time period
         constr_dic.update({f"{f, t, i}1stech_InvBal": LpAffineExpression(((self.production[(i, f, lt[i, t])], 1),
                                                                         *((self.shipment[(f,w,i,t)] , -1) for w in dep[f] if i in self.sku_LOC.get(w, []))))
-                                                                        == self.inv_level[(i,f,t)] + self.demand.get((t,i,f), 0) - self.lost_sales.get((t,i,f), 0)- self.inv_level.get((i,f,prevt[t]), 0)*inital_inv[t]
+                                                                        == self.inv_level[(i,f,t)] + self.demand.get((t,i,f), 0) - self.lost_sales.get((t,i,f), 0)- self.inv_level.get((i,f,prevt[t]), 0)
                                                                         for f in self.factory_id
                                                                         for i in self.intsku_fact.get(f, []) 
                                                                         for t in self.time_id[1: last_t[i]]})
@@ -538,11 +525,11 @@ class InventoryModel():
                                                                         for t in self.time_id[0]})
 
         constr_dic.update({f"{f,t, i}1stech_InvBal": LpAffineExpression([*((self.shipment[(x, f, i, prevt[t])], 1) for x in self.sku_plan.get(i, []))])
-                                                                == self.inv_level[(i,f,t)] + self.demand.get((t,i,f), 0) - self.lost_sales.get((t,i,f), 0) - self.inv_level.get((i,f,prevt[t]), 0)*inital_inv[t]
+                                                                == self.inv_level[(i,f,t)] + self.demand.get((t,i,f), 0) - self.lost_sales.get((t,i,f), 0) - self.inv_level.get((i,f,prevt[t]), 0)
                                                                 for f in self.factory_id
                                                                 for i in self.f2f_sku.get(f, []) 
                                                                 for t in self.time_id[1:last_t[i]]})
-        p = [(i,w) for w in self.loc_id for i in self.sku_LOC.get(w, []) if (self.cw_ss.get((w, i), self.rw_ss.get((w, i), 0)) + self.demand.get((self.time_id[1],i,w), 0)) > 0]
+
         constr_dic.update({f"{w,'0', i}initial": LpAffineExpression([(self.inv_level[(i, w, "0")], 1)])
                                                                   ==  self.cw_ss.get((w, i), self.rw_ss.get((w, i), 0)) + self.demand.get((t,i,w), 0) 
                                                                         for i,w, t in self.inv_idx if t == self.time_id[1]})
@@ -554,7 +541,7 @@ class InventoryModel():
             pass
         constr_dic.update({f"{d,t, i}2ndech_InvBal":LpAffineExpression((*((self.shipment[(f,d,i,prevt[t])], 1) for f in self.sku_plan[i]),
                                                                         *((self.shipment[(d,w,i,t)], -1) for w in self.rw_id if d in cw_to_rw[w] and i in self.sku_LOC.get(w, []))))
-                                                                        == self.inv_level[(i,d,t)] + self.demand.get((t,i,d), 0) - self.lost_sales.get((t,i,d), 0)- self.inv_level.get((i,d,prevt[t]), 0)*inital_inv[t]
+                                                                        == self.inv_level[(i,d,t)] + self.demand.get((t,i,d), 0) - self.lost_sales.get((t,i,d), 0)- self.inv_level.get((i,d,prevt[t]), 0)
                                                                         for d in self.cw_id                 
                                                                         for i in self.intsku_CW.get(d,[])
                                                                         for t in self.time_id[1:last_t[i]]})
@@ -562,21 +549,21 @@ class InventoryModel():
         
         constr_dic.update({f"{w, t, i}3rdech_InvBal":LpAffineExpression((*((self.shipment[(f,w,i,prevt[t])], 1) for f in factory_to_rw[w] if i in self.intsku_fact.get(f, [])),
                                                                         *((self.shipment[(d,w,i,prevt[t])], 1) for d in cw_to_rw[w])))  
-                                                                         == self.inv_level[(i,w,t)] + self.demand.get((t,i,w), 0)  - self.lost_sales.get((t,i,w), 0) - self.inv_level.get((i,w,prevt[t]), 0)*inital_inv[t]
+                                                                         == self.inv_level[(i,w,t)] + self.demand.get((t,i,w), 0)  - self.lost_sales.get((t,i,w), 0) - self.inv_level.get((i,w,prevt[t]), 0)
                                                                             for w in self.rw_id
                                                                             for i in self.intsku_RW.get(w, [])
                                                                             for t in self.time_id[2:last_t_[(w, i)]]})
 
 
         constr_dic.update({f"{f,t,i}1stech_ext_sku_InvBal": LpAffineExpression([*((self.shipment[(e,f,i,prevt[t])], 1) for e in self.supplier[i])])
-                                                                        == self.demand.get((t,i,f), 0) - self.lost_sales.get((t,i,f), 0) + self.inv_level[(i,f,t)] - self.inv_level.get((i,f,prevt[t]), 0)*inital_inv[t]
+                                                                        == self.demand.get((t,i,f), 0) - self.lost_sales.get((t,i,f), 0) + self.inv_level[(i,f,t)] - self.inv_level.get((i,f,prevt[t]), 0)
                                                                         for f in self.factory_id
                                                                         for i in self.extsku_fact.get(f, [])
                                                                         for t in self.time_id[1:last_t[i]]}) 
 
         constr_dic.update({f"{d,t,i}2ndech_ext_sku_InvBal": LpAffineExpression((*((self.shipment[(e,d,i,prevt[t])], 1) for e in self.supplier[i]),
                                                                                *((self.shipment[(d,w,i,t)], -1) for w in self.rw_id if d in cw_to_rw[w] and i in self.sku_LOC.get(w, []))))
-                                                                        == self.demand.get((t,i,d), 0) - self.lost_sales.get((t,i,d), 0) + self.inv_level[(i,d,t)] - self.inv_level.get((i,d,prevt[t]), 0)*inital_inv[t]
+                                                                        == self.demand.get((t,i,d), 0) - self.lost_sales.get((t,i,d), 0) + self.inv_level[(i,d,t)] - self.inv_level.get((i,d,prevt[t]), 0)
                                                                         for d in self.cw_id
                                                                         for i in self.extsku_CW.get(d,[])
                                                                         for t in self.time_id[1:last_t[i]]})
@@ -627,7 +614,8 @@ class InventoryModel():
         m = pd.read_csv(self.batch_size_path,
                         index_col=[0],
                         sep=None,
-                        engine="python")
+                        engine="python",
+                        decimal=self.decimal)
         m = m[m["min_batch_active"] > 0 ] #  only keep min batch size for active skus
         m = m[m.index.isin(self.sku_id)]
         last_t = self.find_last_t()
@@ -851,33 +839,21 @@ class InventoryModel():
         self.inv_model.extend({"service_level_measure": LpAffineExpression((self.lost_sales[(i, w, t)], 1)
                                                                             for i,w,t in self.ls_idx) <= (1- self.service_level) * self.total_demand})
         self.inv_model.extend({"epsilon": self.service_level >= 0})
-        # constr_dic.update({"service_level_measure": LpAffineExpression((self.lost_sales[(i, w, t)], 1)
-        #                                                                     for i,w,t in self.ls_idx) == (1- self.service_level) * self.total_demand})
 
         constr_dic.update({"epsilon": self.service_level >= 0})
         self.inv_model.writeLP("biobj.lp")
         self.save_model_json(self.inv_model, constraints=constr_dic)
-        while epsilon[-1] < 1:
+        while epsilon[-1] < 1.05:
             variables, model = LpProblem.from_json(folder + model_file + ".json")
             with open(folder + model_file + "constraints.json") as f:
                 cons = ujson.load(f)
             self.call_cplex(model)
             print(self.inv_model.status)
-            print("Lost Sales:-----------------")
-            self.ls_result = self.export_vars_3d(indices=self.ls_idx,
-                                                             variable=self.lost_sales,
-                                                             filename="Lost Sales")
-            print(self.ls_result["value"].sum())
-            print("-----")
-            z2 = self.service_level.varValue
-            print("sl var:", z2)
-            # ipdb.set_trace()
             bi_obj_results[epsilon[-1]] = value(model.objective)
-            epsilon.append(epsilon[-1] + 0.1)
+            epsilon.append(epsilon[-1] + 0.05)
             z_score = NormalDist().inv_cdf(min(epsilon[-1], 0.99999))
             print(z_score)
             self.define_paramaters(ftl_matrix_path=self.ftl_matrix_path, s_l=z_score)
-
             model.constraints = OrderedDict(zip(cons.keys(), model.constraints.values())) # rename the constraint for easier altering
             model.constraints["epsilon"].constant = epsilon[-1]
             self.update_constraint_rhs(model.constraints)
@@ -906,24 +882,13 @@ class InventoryModel():
                     start_time = time.time()
                     self.define_variables()
                     self.define_objective()
-                    # pr = cProfile.Profile()
-                    # pr.enable()
 
                     constr_dic = {}
                     constr_dic = self.define_constraints()
                     constr_dic.update(self.direct_sh_constraint())
                     mbsc = self.min_batch_size_constraint(self.batch_size_path)
                     constr_dic.update(mbsc)
-
-                    # pr.disable()
-                    # s = io.StringIO()
-                    # ps = pstats.Stats(pr, stream=s).sort_stats('tottime')
-                    # ps.print_stats()
-
-                    # with open('test.txt', 'w+') as f:
-                    #     f.write(s.getvalue())
-
-                    
+           
                     self.mc_time = time.time() - start_time
                     print("Model Creation Time:-------------",
                           "\n" + str(self.mc_time))
@@ -966,7 +931,6 @@ class InventoryModel():
                         self.ls_result = self.export_vars_3d(indices=self.ls_idx,
                                                              variable=self.lost_sales,
                                                              filename="Lost Sales")
-                        ipdb.set_trace()
                         # self.export_vars_2d(indices=self.slack_ind,
                         #                     variable=self.slack,
                         #                     filename="Slack")
@@ -988,35 +952,21 @@ class InventoryModel():
             solver.solverModel.parameters.emphasis.memory.set(int(param["memory_emphasis"]))
             solver.solverModel.parameters.workmem.set(int(param["working_memory"]))
             solver.solverModel.parameters.mip.strategy.file.set(int(param["node_file"]))
-            solver.solverModel.parameters.mip.cuts.cliques.set(2)
-            solver.solverModel.parameters.mip.cuts.covers.set(2)
-            solver.solverModel.parameters.mip.cuts.flowcovers.set(2)
-            solver.solverModel.parameters.mip.cuts.gomory.set(2)
-            solver.solverModel.parameters.mip.cuts.gubcovers.set(2)
-            solver.solverModel.parameters.mip.cuts.implied.set(2)
-            solver.solverModel.parameters.mip.cuts.mircut.set(2)
-            solver.solverModel.parameters.mip.cuts.pathcut.set(2)
-            solver.solverModel.parameters.mip.limits.cutsfactor.set(30)
-            solver.solverModel.parameters.mip.strategy.branch.set(1)
-            solver.solverModel.parameters.mip.strategy.probe.set(2)
-            # ps = solver.create_parameters_set()
-            # ps.add(solver.solverModel.parameters.workmem, solver.solverModel.parameters.workmem.set(int(param["working_memory"])))
-            # m = solver.solverModel.parameters.tune_problem(solver.solverModel.parameters.workmem.set(int(param["working_memory"])))                                                         
-            
+            solver.solverModel.parameters.mip.cuts.cliques.set(int(param("cuts_clique")))
+            solver.solverModel.parameters.mip.cuts.covers.set(int(param("cuts_covers")))
+            solver.solverModel.parameters.mip.cuts.flowcovers.set(int(param("cuts_flowcovers")))
+            solver.solverModel.parameters.mip.cuts.gomory.set(int(param("cuts_gomory")))
+            solver.solverModel.parameters.mip.cuts.gubcovers.set(int(param("cuts_gubcovers")))
+            solver.solverModel.parameters.mip.cuts.implied.set(int(param("cuts_implied")))
+            solver.solverModel.parameters.mip.cuts.mircut.set(int(param("cuts_mircut")))
+            solver.solverModel.parameters.mip.cuts.pathcut.set(int(param("cuts_path")))
+            solver.solverModel.parameters.mip.limits.cutsfactor.set(int(param("cuts_factor")))
+            solver.solverModel.parameters.mip.strategy.branch.set(int(param("branch_strategy")))
+            solver.solverModel.parameters.mip.strategy.probe.set(int(param("strategy_probe")))
             solver.solverModel.parameters.mip.tolerances.mipgap.set(float(param["mipgap"]))
-        #     # solver.solverModel.parameters.mip.strategy.lbheur.set(True)
-        #     # solver.solverModel.parameters.mip.strategy.bbinterval.set(2)
-        #     # solver.solverModel.parameters.mip.strategy.probe.set(3)
-        #     # solver.solverModel.parameters.mip.strategy.variableselect.set(3)
-        #     solver.solverModel.parameters.emphasis.mip.set(5)
-        #     # solver.solverModel.parameters.mip.cuts.mcfcut.set(2)
-        #     # solver.solverModel.parameters.mip.strategy.presolvenode.set(3)
-        #     # solver.solverModel.parameters.preprocessing.repeatpresolve.set(3)
-        
-
             solver.callSolver(model)
         except cplex.exceptions.errors.CplexSolverError:
-            print("One of the Cplex parametrs specified is invalid. ")
+            print("One of the Cplex parameters specified is invalid. ")
         status = solver.findSolutionValues(model)
         solver.solverModel.parameters.conflict.display.set(2)  # if model is unsolvable will display the problematic constraint(s)
 
@@ -1187,10 +1137,6 @@ class InventoryModel():
 
 # Actually creating an instance of the classes in which the model is defined
 
-t = 53
-mctime_dic = {}
-solvtime_dic = {}
-gen = {}
 start_time = time.time()
 I = InventoryModel(sku_col="SKU_id",
                    time_col="period",
@@ -1210,28 +1156,11 @@ else:
         v.cycle_ss_barplot_rel(inventory=I.inv_result[I.inv_result["time"].isin(I.time_id[1:])],
                                ss=[I.cw_ss_df.reset_index(), I.rw_ss_df.reset_index()])
 
-# mctime_dic[i] = I.mc_time
-# solvtime_dic[i] = I.solv_time
-# gen["model_creation"] = mctime_dic
-# gen["solving time"] = solvtime_dic
-# with open("times.json", "w") as f:
-#     json.dump(gen, f)
-# v.find_intersection(inventory=I.inv_result,
-#                     baseline_path="./CSV input files/baseline.csv")
+
 
 time_taken = time.time() - start_time
 print("Total Time: ", time_taken)
    
 
 
-# calling the function that will assemble the model together
-# pr = cProfile.Profile()
-# pr.enable()
 
-# pr.disable()
-# s = io.StringIO()
-# ps = pstats.Stats(pr, stream=s).sort_stats('tottime')
-# ps.print_stats()
-
-# with open('test.txt', 'w+') as f:
-#     f.write(s.getvalue())
